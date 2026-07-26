@@ -10,7 +10,9 @@
 - [x] Phase 3: Inline and block typography
 - [x] Phase 4: Degrade tables and images
 - [x] Phase 5: Chunker and multi-message send
-- [ ] Phase 6: Oversized block splitting
+- [ ] Phase 6: Oversized block splitting — mechanism landed with the seam
+      change below (R22 satisfied and tested at the chunker level); the phase's
+      adapter-level fixture reassembly test is still outstanding
 - [ ] Phase 7: Fallback counter and warning log
 
 ## Lessons learned
@@ -284,6 +286,50 @@ no status updates, no restatement of the plan.
   produce 2 chunks and 120 produce 4, against a 3500-byte limit. Counting raw
   HTML bytes over-counts against Telegram's entity-stripped UTF-16 measure, but
   not by enough to matter.
+
+- **Seam change — a `Block` is a token sequence, not a rendered string.** The
+  `{Wrappers, Content}` shape chosen in Phase 1 could not carry Phase 6: a
+  blockquote is wrapper-bearing *and* markup-bearing, so `len(Wrappers) > 0` did
+  not tell a splitter whether `Content` was safe to cut, and `Content` being
+  pre-escaped meant a cut could also bisect `&lt;`. The alternatives were a flag
+  distinguishing text-content from markup-content blocks — a special case on
+  shared infrastructure, and one that would refuse to split a long quotation and
+  drop the whole reply to plain text — or re-parsing the HTML in the chunker,
+  which is the second parser this package exists to avoid. `Render` was
+  destroying structure it had just computed from the AST; the fix was to stop
+  doing that.
+- **Seam change — the locked public contract did not have to change.**
+  `Render(src) ([]Block, error)` and `Chunk(blocks, limit) ([]string, error)`
+  are untouched. The plan locks *that `Block` carries enough structure for the
+  chunker to close and reopen wrapping elements*, so replacing an insufficient
+  structure with a sufficient one satisfies the contract rather than breaking
+  it. No replan trigger fired. `Wrapper` is gone as a type — the chunker's tag
+  stack is what it was standing in for.
+- **Seam change — tag balance is now structural.** A chunk ends by closing
+  whatever is open and begins by reopening it, so an unbalanced chunk is not
+  expressible. R19 stops being something a test checks after the fact. R22 falls
+  out with no special case, and the language class reopens on each chunk for
+  free because the stack holds the opening token's attributes.
+- **Seam change — text tokens hold *escaped* text, not raw.** Raw text would
+  make a split safe by construction, but it would also mean re-escaping on every
+  `Len()` — which the chunker calls per token — and rewriting every escaping call
+  site. Escaped text keeps `Len()` free and the renderer's escaping untouched, at
+  the cost of one explicit rule: a cut must clear entity boundaries as well as
+  rune boundaries (`textCut`, `entityStart`). That rule is swept exhaustively
+  rather than sampled.
+- **Seam change — the exhaustive sweep found a real behaviour question the
+  hand-picked cases missed.** Chunking a rich document at *every* limit from 1
+  byte upward showed that a chunk boundary landing between two blocks absorbs the
+  `\n\n` separator. That is correct — two chunks are two Telegram messages,
+  already visually separated, and a trailing blank line is trimmed anyway — but
+  it is not what a naive reassembly assertion expects. The test now compares
+  block by block: whitespace *between* blocks is free, everything *inside* a
+  block is byte-exact, which is what keeps a dropped soft line break visible.
+- **Seam change — the sweep was verified by sabotage, not by passing.** Dropping
+  one rune per split and skipping the tag reopen were each injected into the
+  chunker and each caught. A property test over hundreds of limits is worthless
+  if its matcher cannot fail, and the first matcher written for this could not
+  distinguish a lost block separator from a lost line break inside a block.
 
 ### Deferred to system testing
 

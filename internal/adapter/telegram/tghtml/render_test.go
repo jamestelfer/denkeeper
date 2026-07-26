@@ -542,7 +542,7 @@ func TestRender_TableColumnsStartAtTheSameOffsetOnEveryRow(t *testing.T) {
 		t.Fatalf("block count = %d, want 1", len(blocks))
 	}
 
-	lines := strings.Split(blocks[0].Content, "\n")
+	lines := strings.Split(preContent(t, blocks[0].HTML()), "\n")
 	if len(lines) != 5 {
 		t.Fatalf("line count = %d, want 5 (header, rule, three rows)", len(lines))
 	}
@@ -777,10 +777,10 @@ func TestRender_HeadingInsideListItemDoesNotOpenABlankLine(t *testing.T) {
 	assertTagBalanced(t, got)
 }
 
-// TestRender_FencedCodeBlockCarriesWrappers covers the Block shape the chunker
-// depends on: a splittable block keeps its enclosing elements out of Content so
-// they can be closed and reopened across a split.
-func TestRender_FencedCodeBlockCarriesWrappers(t *testing.T) {
+// TestRender_FencedCodeBlockKeepsItsTagsSeparateFromItsText covers the Block
+// shape the chunker depends on: the enclosing elements are their own tokens, so
+// a split can close and reopen them without any string inspection.
+func TestRender_FencedCodeBlockKeepsItsTagsSeparateFromItsText(t *testing.T) {
 	blocks, err := Render([]byte("```go\nfmt.Println(\"hi\")\n```"))
 	if err != nil {
 		t.Fatalf("Render: %v", err)
@@ -790,22 +790,40 @@ func TestRender_FencedCodeBlockCarriesWrappers(t *testing.T) {
 	}
 	b := blocks[0]
 
-	if len(b.Wrappers) != 2 {
-		t.Fatalf("wrappers = %v, want two (pre outside, code inside)", b.Wrappers)
+	want := []token{
+		openToken("pre", ""),
+		openToken("code", ` class="language-go"`),
+		textToken("fmt.Println(\"hi\")\n"),
+		closeToken("code"),
+		closeToken("pre"),
 	}
-	if b.Wrappers[0].Open != "<pre>" || b.Wrappers[0].Close != "</pre>" {
-		t.Errorf("outer wrapper = %+v, want <pre>", b.Wrappers[0])
+	if len(b.tokens) != len(want) {
+		t.Fatalf("tokens = %+v, want %+v", b.tokens, want)
 	}
-	if b.Wrappers[1].Open != `<code class="language-go">` {
-		t.Errorf("inner wrapper open = %q, want the language class", b.Wrappers[1].Open)
+	for i := range want {
+		if b.tokens[i] != want[i] {
+			t.Errorf("token %d = %+v, want %+v", i, b.tokens[i], want[i])
+		}
 	}
-	if b.Content != "fmt.Println(\"hi\")\n" {
-		t.Errorf("Content = %q, want the code with no enclosing tags", b.Content)
+
+	wantHTML := "<pre><code class=\"language-go\">fmt.Println(\"hi\")\n</code></pre>"
+	if got := b.HTML(); got != wantHTML {
+		t.Errorf("HTML() = %q, want %q", got, wantHTML)
 	}
-	want := "<pre><code class=\"language-go\">fmt.Println(\"hi\")\n</code></pre>"
-	if got := b.HTML(); got != want {
-		t.Errorf("HTML() = %q, want %q", got, want)
+	if got := b.Len(); got != len(wantHTML) {
+		t.Errorf("Len() = %d, want %d — length must not need the string built", got, len(wantHTML))
 	}
+}
+
+// preContent returns the text inside a single pre element, for tests that assert
+// on a degraded table's grid rather than on its markup.
+func preContent(t *testing.T, html string) string {
+	t.Helper()
+	const open, close = "<pre>", "</pre>"
+	if !strings.HasPrefix(html, open) || !strings.HasSuffix(html, close) {
+		t.Fatalf("html = %q, want a single pre element", html)
+	}
+	return html[len(open) : len(html)-len(close)]
 }
 
 // TestRender_FencedCodeCarriesItsLanguage covers R13. Telegram documents the

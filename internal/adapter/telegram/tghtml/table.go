@@ -58,10 +58,11 @@ func renderTable(src []byte, table *east.Table) Block {
 		lines = slices.Insert(lines, 1, headerRule(lines))
 	}
 
-	return Block{
-		Wrappers: []Wrapper{{Open: "<pre>", Close: "</pre>"}},
-		Content:  escapeText([]byte(strings.Join(lines, "\n")), true),
-	}
+	var sb blockBuilder
+	sb.open("pre", "")
+	sb.WriteString(escapeText([]byte(strings.Join(lines, "\n")), true))
+	sb.close("pre")
+	return sb.block()
 }
 
 // layoutRows aligns every row's cells into fixed-width columns.

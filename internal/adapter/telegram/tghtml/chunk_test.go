@@ -1,6 +1,7 @@
 package tghtml
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -8,7 +9,11 @@ import (
 
 // textBlock builds a Block of plain content, for chunker cases where what is in
 // the block does not matter, only how long it is.
-func textBlock(content string) Block { return Block{Content: content} }
+func textBlock(content string) Block {
+	var b blockBuilder
+	b.WriteString(content)
+	return b.block()
+}
 
 // assertChunksValid applies the invariants every chunker test shares: no chunk
 // over the limit, and every chunk tag-balanced. R19's balance check is asserted
@@ -132,25 +137,96 @@ func TestChunk_PreservesEverythingInSourceOrder(t *testing.T) {
 	}
 }
 
-// TestChunk_OversizedBlockGoesOutWholeAndAlone pins this phase's interim
-// behaviour for a block that cannot fit on its own. Splitting it is a separate
-// change; until then it must not be truncated, dropped, looped over, or packed
-// with a neighbour.
-func TestChunk_OversizedBlockGoesOutWholeAndAlone(t *testing.T) {
+// TestChunk_OversizedBlockIsSplitWithoutLoss covers a block too large to fit on
+// its own. It used to go out whole and over-limit, because a chunker packing
+// pre-rendered strings had nowhere safe to cut; a block is a token sequence now,
+// so the cut is taken inside a text token.
+func TestChunk_OversizedBlockIsSplitWithoutLoss(t *testing.T) {
 	huge := strings.Repeat("x", 100)
 	blocks := []Block{textBlock("before"), textBlock(huge), textBlock("after")}
 
-	chunks, err := Chunk(blocks, 20)
+	const limit = 20
+	chunks, err := Chunk(blocks, limit)
 	if err != nil {
 		t.Fatalf("Chunk: %v", err)
 	}
-	want := []string{"before", huge, "after"}
-	if len(chunks) != len(want) {
-		t.Fatalf("chunk count = %d, want %d: %q", len(chunks), len(want), chunks)
+	assertChunksValid(t, chunks, limit)
+
+	// Concatenating strips nothing: these blocks carry no markup, so the joined
+	// chunks are exactly the joined blocks with the separators intact.
+	if got, want := strings.Join(chunks, ""), Join(blocks); got != want {
+		t.Errorf("rejoined chunks = %q, want %q", got, want)
 	}
-	for i := range want {
-		if chunks[i] != want[i] {
-			t.Errorf("chunk %d = %q, want %q", i, chunks[i], want[i])
+	if n := strings.Count(strings.Join(chunks, ""), "x"); n != 100 {
+		t.Errorf("output carries %d of the 100 x's — content was lost or duplicated", n)
+	}
+}
+
+// TestChunk_OversizedWrappedBlockReopensItsElements is the property the token
+// representation exists for: a code block larger than the limit splits into
+// several chunks, each a well-formed pre/code block carrying the language
+// annotation, and the text content survives exactly.
+func TestChunk_OversizedWrappedBlockReopensItsElements(t *testing.T) {
+	body := strings.Repeat("fmt.Println(\"x\")\n", 40)
+	blocks, err := Render([]byte("```go\n" + body + "```"))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("block count = %d, want 1", len(blocks))
+	}
+
+	const limit = 200
+	chunks, err := Chunk(blocks, limit)
+	if err != nil {
+		t.Fatalf("Chunk: %v", err)
+	}
+	if len(chunks) < 3 {
+		t.Fatalf("chunk count = %d, want several", len(chunks))
+	}
+	assertChunksValid(t, chunks, limit)
+
+	var text strings.Builder
+	for i, c := range chunks {
+		const open = `<pre><code class="language-go">`
+		const closed = "</code></pre>"
+		if !strings.HasPrefix(c, open) {
+			t.Fatalf("chunk %d = %q, want it to reopen the annotated code block", i, c)
+		}
+		if !strings.HasSuffix(c, closed) {
+			t.Fatalf("chunk %d = %q, want it to close the code block", i, c)
+		}
+		text.WriteString(c[len(open) : len(c)-len(closed)])
+	}
+	if got := text.String(); got != body {
+		t.Errorf("reassembled code = %q, want the original %q", got, body)
+	}
+}
+
+// TestChunk_SplitNeverLandsInsideAnEntity is the escaping counterpart of the
+// rune-boundary rule. Text tokens hold escaped text, so a cut at an arbitrary
+// byte could bisect "&amp;" and emit a fragment Telegram would show literally.
+// Swept across every limit rather than sampled.
+func TestChunk_SplitNeverLandsInsideAnEntity(t *testing.T) {
+	blocks, err := Render([]byte("a < b & c > d and more < & > text here to push it along"))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	joined := Join(blocks)
+
+	for limit := 1; limit <= len(joined)+1; limit++ {
+		chunks, err := Chunk(blocks, limit)
+		if err != nil {
+			t.Fatalf("Chunk(limit=%d): %v", limit, err)
+		}
+		rejoined := strings.Join(chunks, "")
+		if rejoined != joined {
+			t.Fatalf("limit=%d: rejoined = %q, want %q", limit, rejoined, joined)
+		}
+		for i, c := range chunks {
+			if strings.Count(c, "&") != strings.Count(c, ";") {
+				t.Fatalf("limit=%d chunk %d = %q — an entity was split", limit, i, c)
+			}
 		}
 	}
 }
@@ -178,6 +254,117 @@ func TestChunk_OversizedBlockTerminatesAtAnyLimit(t *testing.T) {
 		if total < 1001 {
 			t.Errorf("Chunk(limit=%d) emitted %d bytes, want at least the 1001 bytes of content", limit, total)
 		}
+	}
+}
+
+// TestChunk_EveryLimitProducesBalancedChunksAndLosesNothing is the property the
+// whole token representation exists to make true, swept exhaustively.
+//
+// A rich document is chunked at every limit from one byte upward. At each one,
+// every chunk must be tag-balanced and use only Telegram's tags, and the text
+// content — the message with its markup stripped, which is what a reader
+// actually sees — must come back exactly. No sampling: the interesting limits
+// are the ones that land a split inside a tag, an entity or a rune, and those
+// are precisely the ones a hand-picked case misses.
+func TestChunk_EveryLimitProducesBalancedChunksAndLosesNothing(t *testing.T) {
+	src := strings.Join([]string{
+		"# Heading with a **bold** word",
+		"",
+		"Prose with *italic*, `code_span`, ~~struck~~, a < b & c, and a",
+		"[link](https://example.com/a_b) that wraps across lines.",
+		"",
+		"> a quotation where 5 < 6 & 7 > 3, plus 日本語 text",
+		"",
+		"- parent bullet with émphasis",
+		"    - child bullet",
+		"",
+		"| a | b |",
+		"|---|---|",
+		"| 1 | 2 |",
+		"",
+		"```go",
+		"if a < b { return \"ok\" } // 🎉",
+		"```",
+	}, "\n")
+
+	blocks, err := Render([]byte(src))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	// Per block, not one flattened string: whitespace *between* blocks is what a
+	// chunk boundary may absorb, while a newline *inside* a block is content and
+	// must survive exactly. Flattening first would conflate the two.
+	want := make([]string, 0, len(blocks))
+	for _, blk := range blocks {
+		want = append(want, stripTags(blk.HTML()))
+	}
+
+	for limit := 1; limit <= len(Join(blocks))+1; limit++ {
+		chunks, err := Chunk(blocks, limit)
+		if err != nil {
+			t.Fatalf("Chunk(limit=%d): %v", limit, err)
+		}
+		var text strings.Builder
+		for i, c := range chunks {
+			if !utf8.ValidString(c) {
+				t.Fatalf("limit=%d chunk %d is not valid UTF-8: %q", limit, i, c)
+			}
+			// Balance is asserted on every chunk at every limit: it is the
+			// invariant the adapter cannot recover from if it is ever violated.
+			assertTagBalanced(t, c)
+			text.WriteString(stripTags(c))
+		}
+		if err := matchBlockTexts(text.String(), want); err != nil {
+			t.Fatalf("limit=%d: %v", limit, err)
+		}
+	}
+}
+
+// matchBlockTexts checks that got is exactly the blocks' texts in order,
+// separated by nothing but newlines.
+//
+// A chunk boundary landing between two blocks absorbs the separator — the two
+// become separate Telegram messages, already visually apart, and a trailing
+// blank line would only be trimmed — so the run of newlines between blocks is
+// free. Everything inside a block is compared byte for byte, which is what keeps
+// a dropped soft line break or a bisected entity visible.
+func matchBlockTexts(got string, want []string) error {
+	pos := 0
+	for i, w := range want {
+		for pos < len(got) && got[pos] == '\n' {
+			pos++
+		}
+		if !strings.HasPrefix(got[pos:], w) {
+			return fmt.Errorf("at block %d: got %q, want it to continue with %q", i, got[pos:], w)
+		}
+		pos += len(w)
+	}
+	if rest := strings.TrimLeft(got[pos:], "\n"); rest != "" {
+		return fmt.Errorf("trailing content after the last block: %q", rest)
+	}
+	return nil
+}
+
+// stripTags removes every element, leaving the text a reader sees. It relies on
+// the renderer escaping every literal '<' in text content, which the R3 cases
+// pin independently.
+func stripTags(html string) string {
+	var sb strings.Builder
+	for {
+		open := strings.IndexByte(html, '<')
+		if open < 0 {
+			sb.WriteString(html)
+			return sb.String()
+		}
+		sb.WriteString(html[:open])
+		closeAt := strings.IndexByte(html[open:], '>')
+		if closeAt < 0 {
+			// An unterminated tag is a balance failure the caller asserts on;
+			// keep the remainder so the mismatch is visible rather than hidden.
+			sb.WriteString(html[open:])
+			return sb.String()
+		}
+		html = html[open+closeAt+1:]
 	}
 }
 

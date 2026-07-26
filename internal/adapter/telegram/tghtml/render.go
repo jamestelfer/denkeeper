@@ -42,100 +42,6 @@ var mdParser = goldmark.New(
 	goldmark.WithExtensions(extension.Strikethrough, extension.Table),
 ).Parser()
 
-// Wrapper is an element that encloses a block's content. A block's wrappers are
-// ordered outermost first, so a fenced code block carries {<pre>}, {<code>}.
-//
-// Wrappers exist so an oversized block can be split with its enclosing elements
-// closed at the end of one chunk and reopened at the start of the next. Only
-// blocks that are realistically splittable carry them; everything else puts its
-// markup in Content, which is already tag-balanced.
-type Wrapper struct {
-	Open  string
-	Close string
-}
-
-// Block is one unit of rendered output in which every opened element is closed.
-type Block struct {
-	// Wrappers enclose Content, outermost first.
-	Wrappers []Wrapper
-	// Content is the block's inner HTML. It is already escaped and balanced.
-	Content string
-}
-
-// HTML returns the block's complete HTML: every wrapper opened outermost first,
-// then the content, then every wrapper closed innermost first.
-func (b Block) HTML() string {
-	if len(b.Wrappers) == 0 {
-		return b.Content
-	}
-	var sb strings.Builder
-	sb.Grow(b.Len())
-	b.writeTo(&sb)
-	return sb.String()
-}
-
-// writeTo appends the block's HTML to sb. The chunker uses it to write straight
-// into the active chunk rather than materialising each block's HTML first.
-func (b Block) writeTo(sb *strings.Builder) {
-	for _, w := range b.Wrappers {
-		sb.WriteString(w.Open)
-	}
-	sb.WriteString(b.Content)
-	for i := len(b.Wrappers) - 1; i >= 0; i-- {
-		sb.WriteString(b.Wrappers[i].Close)
-	}
-}
-
-// Len reports the byte length of the block's HTML, without building it. The
-// chunker asks this of every block, so it must not allocate.
-func (b Block) Len() int {
-	n := len(b.Content)
-	for _, w := range b.Wrappers {
-		n += len(w.Open) + len(w.Close)
-	}
-	return n
-}
-
-// BlockSeparator joins adjacent blocks. A blank line reproduces the paragraph
-// spacing a reader expects and is what upstream emitted between paragraphs.
-const BlockSeparator = "\n\n"
-
-// Join concatenates blocks in order, separated by BlockSeparator. The result is
-// tag-balanced because every block is.
-//
-// Join and Chunk are the same packing with and without a size bound, so both go
-// through appendBlock and cannot disagree about separators.
-func Join(blocks []Block) string {
-	var sb strings.Builder
-	for _, b := range blocks {
-		appendBlock(&sb, b)
-	}
-	return sb.String()
-}
-
-// appendBlock writes b into sb, preceded by whatever part of BlockSeparator sb
-// does not already end with. It is the single place blocks are concatenated.
-func appendBlock(sb *strings.Builder, b Block) {
-	if sb.Len() > 0 {
-		sb.WriteString(separatorAfter(sb.String(), BlockSeparator))
-	}
-	b.writeTo(sb)
-}
-
-// separatorAfter returns the part of sep still needed after prev.
-//
-// A block may end in a newline of its own — a heading does, because R14 makes
-// the line break part of the heading. Writing the full separator on top of it
-// would open a second blank line, so the newlines prev already contributed are
-// deducted. sep is always a run of newlines.
-func separatorAfter(prev, sep string) string {
-	trailing := len(prev) - len(strings.TrimRight(prev, "\n"))
-	if trailing > len(sep) {
-		trailing = len(sep)
-	}
-	return sep[trailing:]
-}
-
 // Render parses src as CommonMark and returns its Telegram-HTML blocks in
 // source order. One top-level markdown node produces at most one block, so a
 // block quotation containing a list is a single block rather than several.
@@ -178,37 +84,38 @@ func renderBlockNode(src []byte, node ast.Node) (Block, bool, error) {
 
 	switch n := node.(type) {
 	case *ast.Blockquote:
-		var sb strings.Builder
-		if err := writeChildBlocks(&sb, src, n, BlockSeparator); err != nil {
+		var inner blockBuilder
+		if err := writeChildBlocks(&inner, src, n, BlockSeparator); err != nil {
 			return Block{}, false, err
 		}
-		if sb.Len() == 0 {
+		if inner.Len() == 0 {
 			return Block{}, false, nil
 		}
-		return Block{
-			Wrappers: []Wrapper{{Open: "<blockquote>", Close: "</blockquote>"}},
-			Content:  sb.String(),
-		}, true, nil
+		var sb blockBuilder
+		sb.open("blockquote", "")
+		sb.appendTokens(inner.tokens)
+		sb.close("blockquote")
+		return sb.block(), true, nil
 	}
 
-	var sb strings.Builder
+	var sb blockBuilder
 	if err := writeBlockContent(&sb, src, node); err != nil {
 		return Block{}, false, err
 	}
 	if sb.Len() == 0 {
 		return Block{}, false, nil
 	}
-	return Block{Content: sb.String()}, true, nil
+	return sb.block(), true, nil
 }
 
-// wrappedBlockFor returns the Block for the node kinds that carry wrappers — the
-// enclosing elements a split has to close at the end of one chunk and reopen at
-// the start of the next.
+// wrappedBlockFor returns the Block for the node kinds whose content is enclosed
+// in elements — the ones a split has to close at the end of one chunk and reopen
+// at the start of the next.
 //
 // Both positions a block can appear in need it, which is why it is one function
 // rather than a case arm in each switch: at top level the Block is the block,
-// and nested inside a list item or a quotation its HTML goes into the enclosing
-// block's content, because wrappers describe what encloses a block as a whole.
+// and nested inside a list item or a quotation its tokens are spliced into the
+// enclosing block.
 func wrappedBlockFor(src []byte, node ast.Node) (Block, bool) {
 	switch n := node.(type) {
 	case *ast.FencedCodeBlock:
@@ -224,17 +131,17 @@ func wrappedBlockFor(src []byte, node ast.Node) (Block, bool) {
 // codeBlock builds a pre-wrapped code block. Telegram's subset nests code inside
 // pre, in that order.
 func codeBlock(src []byte, n ast.Node, language []byte) Block {
-	open := "<code>"
+	var attr string
 	if len(language) > 0 {
-		open = `<code class="language-` + escapeAttr(language) + `">`
+		attr = ` class="language-` + escapeAttr(language) + `"`
 	}
-	return Block{
-		Wrappers: []Wrapper{
-			{Open: "<pre>", Close: "</pre>"},
-			{Open: open, Close: "</code>"},
-		},
-		Content: blockLines(src, n),
-	}
+	var sb blockBuilder
+	sb.open("pre", "")
+	sb.open("code", attr)
+	sb.WriteString(blockLines(src, n))
+	sb.close("code")
+	sb.close("pre")
+	return sb.block()
 }
 
 // blockLines renders a block's raw source lines as escaped text. Code content is
@@ -252,11 +159,11 @@ func blockLines(src []byte, n ast.Node) string {
 // writeBlockContent renders a block-level node's content, without wrappers.
 // It recurses for constructs that contain other blocks, so a quotation holding a
 // list stays one block.
-func writeBlockContent(sb *strings.Builder, src []byte, node ast.Node) error {
+func writeBlockContent(sb *blockBuilder, src []byte, node ast.Node) error {
 	// A wrapper-bearing kind nested inside another block puts its markup in the
 	// enclosing block's content rather than becoming a wrapper of its own.
 	if block, ok := wrappedBlockFor(src, node); ok {
-		block.writeTo(sb)
+		sb.appendTokens(block.tokens)
 		return nil
 	}
 
@@ -267,11 +174,12 @@ func writeBlockContent(sb *strings.Builder, src []byte, node ast.Node) error {
 		// without it a heading runs into the following sentence wherever the
 		// surrounding joiner is not itself a line break. Join collapses its
 		// separator against this newline so the gap stays one blank line.
-		sb.WriteString("<b>")
+		sb.open("b", "")
 		if err := renderInlineChildren(sb, src, n); err != nil {
 			return err
 		}
-		sb.WriteString("</b>\n")
+		sb.close("b")
+		sb.WriteString("\n")
 		return nil
 
 	case *ast.ThematicBreak:
@@ -324,13 +232,13 @@ const maxListIndentDepth = 6
 // Upstream wrote a constant "- " for every item at every depth and never
 // inspected ast.List.IsOrdered or Start, so ordered lists became bullets and
 // nested lists flattened. Both come from the same place and are fixed together.
-func writeList(sb *strings.Builder, src []byte, list *ast.List, depth int) error {
+func writeList(sb *blockBuilder, src []byte, list *ast.List, depth int) error {
 	ordinal := list.Start
 	indent := listIndentFor(depth)
 
 	first := true
 	for item := list.FirstChild(); item != nil; item = item.NextSibling() {
-		var inner strings.Builder
+		var inner blockBuilder
 		if err := writeListItem(&inner, src, item, depth); err != nil {
 			return err
 		}
@@ -338,7 +246,7 @@ func writeList(sb *strings.Builder, src []byte, list *ast.List, depth int) error
 			continue
 		}
 		if !first {
-			sb.WriteString(separatorAfter(sb.String(), "\n"))
+			sb.writeSeparator("\n")
 		}
 		sb.WriteString(indent)
 		if list.IsOrdered() {
@@ -350,7 +258,7 @@ func writeList(sb *strings.Builder, src []byte, list *ast.List, depth int) error
 		} else {
 			sb.WriteString("- ")
 		}
-		sb.WriteString(inner.String())
+		sb.appendTokens(inner.tokens)
 		first = false
 	}
 	return nil
@@ -358,22 +266,22 @@ func writeList(sb *strings.Builder, src []byte, list *ast.List, depth int) error
 
 // writeListItem renders one item's content. A nested list becomes its own set of
 // lines, indented one level deeper; everything else is the item's own text.
-func writeListItem(sb *strings.Builder, src []byte, item ast.Node, depth int) error {
-	var text strings.Builder
-	var nested []string
+func writeListItem(sb *blockBuilder, src []byte, item ast.Node, depth int) error {
+	var text blockBuilder
+	var nested []blockBuilder
 
 	for child := item.FirstChild(); child != nil; child = child.NextSibling() {
 		if list, ok := child.(*ast.List); ok {
-			var sub strings.Builder
+			var sub blockBuilder
 			if err := writeList(&sub, src, list, depth+1); err != nil {
 				return err
 			}
 			if sub.Len() > 0 {
-				nested = append(nested, sub.String())
+				nested = append(nested, sub)
 			}
 			continue
 		}
-		var part strings.Builder
+		var part blockBuilder
 		if err := writeBlockContent(&part, src, child); err != nil {
 			return err
 		}
@@ -381,15 +289,15 @@ func writeListItem(sb *strings.Builder, src []byte, item ast.Node, depth int) er
 			continue
 		}
 		if text.Len() > 0 {
-			text.WriteString(separatorAfter(text.String(), "\n"))
+			text.writeSeparator("\n")
 		}
-		text.WriteString(part.String())
+		text.appendTokens(part.tokens)
 	}
 
-	sb.WriteString(text.String())
+	sb.appendTokens(text.tokens)
 	for _, n := range nested {
-		sb.WriteString(separatorAfter(sb.String(), "\n"))
-		sb.WriteString(n)
+		sb.writeSeparator("\n")
+		sb.appendTokens(n.tokens)
 	}
 	return nil
 }
@@ -404,10 +312,10 @@ func listIndentFor(depth int) string {
 
 // writeChildBlocks renders a node's block-level children, joined by sep, and
 // skips children that render empty so the separator never doubles.
-func writeChildBlocks(sb *strings.Builder, src []byte, node ast.Node, sep string) error {
+func writeChildBlocks(sb *blockBuilder, src []byte, node ast.Node, sep string) error {
 	first := true
 	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
-		var inner strings.Builder
+		var inner blockBuilder
 		if err := writeBlockContent(&inner, src, child); err != nil {
 			return err
 		}
@@ -415,16 +323,16 @@ func writeChildBlocks(sb *strings.Builder, src []byte, node ast.Node, sep string
 			continue
 		}
 		if !first {
-			sb.WriteString(separatorAfter(sb.String(), sep))
+			sb.writeSeparator(sep)
 		}
-		sb.WriteString(inner.String())
+		sb.appendTokens(inner.tokens)
 		first = false
 	}
 	return nil
 }
 
 // renderInlineChildren renders a node's inline descendants into sb.
-func renderInlineChildren(sb *strings.Builder, src []byte, node ast.Node) error {
+func renderInlineChildren(sb *blockBuilder, src []byte, node ast.Node) error {
 	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
 		if err := renderInline(sb, src, child); err != nil {
 			return err
@@ -434,7 +342,7 @@ func renderInlineChildren(sb *strings.Builder, src []byte, node ast.Node) error 
 }
 
 // renderInline renders a single inline node.
-func renderInline(sb *strings.Builder, src []byte, node ast.Node) error {
+func renderInline(sb *blockBuilder, src []byte, node ast.Node) error {
 	switch n := node.(type) {
 	case *ast.Text:
 		sb.WriteString(textContent(src, n))
@@ -451,11 +359,11 @@ func renderInline(sb *strings.Builder, src []byte, node ast.Node) error {
 		return renderEmphasis(sb, src, n)
 	case *east.Strikethrough:
 		// Telegram's subset spells strikethrough <s>; it has no <del>.
-		sb.WriteString("<s>")
+		sb.open("s", "")
 		if err := renderInlineChildren(sb, src, n); err != nil {
 			return err
 		}
-		sb.WriteString("</s>")
+		sb.close("s")
 		return nil
 	case *ast.CodeSpan:
 		renderCodeSpan(sb, src, n)
@@ -481,12 +389,12 @@ func renderInline(sb *strings.Builder, src []byte, node ast.Node) error {
 // Dropping the anchor entirely is a correction of upstream, which kept the
 // anchor and blanked its href. An empty-href anchor is also a plausible Telegram
 // rejection, which would route the whole message to the plain-text fallback.
-func renderLink(sb *strings.Builder, src []byte, n *ast.Link) error {
-	var label strings.Builder
+func renderLink(sb *blockBuilder, src []byte, n *ast.Link) error {
+	var label blockBuilder
 	if err := renderInlineChildren(&label, src, n); err != nil {
 		return err
 	}
-	writeAnchor(sb, n.Destination, label.String())
+	writeAnchor(sb, n.Destination, label.tokens)
 	return nil
 }
 
@@ -497,19 +405,19 @@ func renderLink(sb *strings.Builder, src []byte, n *ast.Link) error {
 // through here. The allowlist is the security-relevant decision in this package
 // and upstream's autolink handler bypassed its own copy of the check entirely,
 // so there is exactly one copy of it on the emitting side.
-func writeAnchor(sb *strings.Builder, dest []byte, label string) {
+// The label is a token sequence, not a string: a link's text can carry its own
+// emphasis, and flattening it here would hide that markup from the chunker.
+func writeAnchor(sb *blockBuilder, dest []byte, label []token) {
 	if !schemeAllowed(dest) {
 		// Label only. The destination is not emitted at all, in any form:
 		// Telegram autolinks visible text after parsing, so leaving a rejected
 		// destination in the text could hand it back a live link.
-		sb.WriteString(label)
+		sb.appendTokens(label)
 		return
 	}
-	sb.WriteString(`<a href="`)
-	sb.WriteString(escapeAttr(dest))
-	sb.WriteString(`">`)
-	sb.WriteString(label)
-	sb.WriteString(`</a>`)
+	sb.open("a", ` href="`+escapeAttr(dest)+`"`)
+	sb.appendTokens(label)
+	sb.close("a")
 }
 
 // renderImage degrades an image to an anchor labelled with its alternative
@@ -522,20 +430,19 @@ func writeAnchor(sb *strings.Builder, dest []byte, label string) {
 // An image with neither an allowlisted destination nor alternative text emits
 // nothing: the destination is exactly what must not be shown, and a placeholder
 // would be text the author never wrote.
-func renderImage(sb *strings.Builder, src []byte, n *ast.Image) error {
-	var label strings.Builder
+func renderImage(sb *blockBuilder, src []byte, n *ast.Image) error {
+	var label blockBuilder
 	if err := renderInlineChildren(&label, src, n); err != nil {
 		return err
 	}
 
-	text := label.String()
-	if text == "" && schemeAllowed(n.Destination) {
+	if label.Len() == 0 && schemeAllowed(n.Destination) {
 		// No alternative text to label the anchor with. The destination is
 		// allowlisted, so showing it is safe and is more useful than an empty
 		// anchor, which Telegram would render as nothing at all.
-		text = escapeText(n.Destination, true)
+		label.WriteString(escapeText(n.Destination, true))
 	}
-	writeAnchor(sb, n.Destination, text)
+	writeAnchor(sb, n.Destination, label.tokens)
 	return nil
 }
 
@@ -545,12 +452,14 @@ func renderImage(sb *strings.Builder, src []byte, n *ast.Image) error {
 // A rejected autolink keeps its label, which is also its destination — there is
 // nothing else to fall back to, and it is no more reachable than the same string
 // written as ordinary prose.
-func renderAutoLink(sb *strings.Builder, src []byte, n *ast.AutoLink) error {
+func renderAutoLink(sb *blockBuilder, src []byte, n *ast.AutoLink) error {
 	dest := n.URL(src)
 	if n.AutoLinkType == ast.AutoLinkEmail {
 		dest = emailDestination(dest)
 	}
-	writeAnchor(sb, dest, escapeText(n.Label(src), true))
+	var label blockBuilder
+	label.WriteString(escapeText(n.Label(src), true))
+	writeAnchor(sb, dest, label.tokens)
 	return nil
 }
 
@@ -559,8 +468,8 @@ func renderAutoLink(sb *strings.Builder, src []byte, n *ast.AutoLink) error {
 // Unlike upstream, the children are not type-asserted to *ast.Text. A code span
 // can hold other node kinds, and an unchecked assertion would panic inside the
 // adapter's send path on user-supplied content.
-func renderCodeSpan(sb *strings.Builder, src []byte, n *ast.CodeSpan) {
-	sb.WriteString("<code>")
+func renderCodeSpan(sb *blockBuilder, src []byte, n *ast.CodeSpan) {
+	sb.open("code", "")
 	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
 		switch child := c.(type) {
 		case *ast.Text:
@@ -578,12 +487,10 @@ func renderCodeSpan(sb *strings.Builder, src []byte, n *ast.CodeSpan) {
 		default:
 			// Unknown inline kind inside a code span: emit its text content
 			// rather than dropping it or panicking.
-			var inner strings.Builder
-			_ = renderInlineChildren(&inner, src, c)
-			sb.WriteString(inner.String())
+			_ = renderInlineChildren(sb, src, c)
 		}
 	}
-	sb.WriteString("</code>")
+	sb.close("code")
 }
 
 // stringContent renders an ast.String, which carries its bytes inline rather
@@ -597,16 +504,16 @@ func stringContent(n *ast.String) string {
 
 // renderEmphasis wraps its children in Telegram's italic or bold element.
 // Telegram's subset has no <em>/<strong>, so level 1 is <i> and level 2 is <b>.
-func renderEmphasis(sb *strings.Builder, src []byte, n *ast.Emphasis) error {
+func renderEmphasis(sb *blockBuilder, src []byte, n *ast.Emphasis) error {
 	tag := "i"
 	if n.Level == 2 {
 		tag = "b"
 	}
-	sb.WriteString("<" + tag + ">")
+	sb.open(tag, "")
 	if err := renderInlineChildren(sb, src, n); err != nil {
 		return err
 	}
-	sb.WriteString("</" + tag + ">")
+	sb.close(tag)
 	return nil
 }
 
