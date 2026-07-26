@@ -69,6 +69,14 @@ func (b Block) HTML() string {
 		return b.Content
 	}
 	var sb strings.Builder
+	sb.Grow(b.Len())
+	b.writeTo(&sb)
+	return sb.String()
+}
+
+// writeTo appends the block's HTML to sb. The chunker uses it to write straight
+// into the active chunk rather than materialising each block's HTML first.
+func (b Block) writeTo(sb *strings.Builder) {
 	for _, w := range b.Wrappers {
 		sb.WriteString(w.Open)
 	}
@@ -76,11 +84,17 @@ func (b Block) HTML() string {
 	for i := len(b.Wrappers) - 1; i >= 0; i-- {
 		sb.WriteString(b.Wrappers[i].Close)
 	}
-	return sb.String()
 }
 
-// Len reports the byte length of the block's HTML.
-func (b Block) Len() int { return len(b.HTML()) }
+// Len reports the byte length of the block's HTML, without building it. The
+// chunker asks this of every block, so it must not allocate.
+func (b Block) Len() int {
+	n := len(b.Content)
+	for _, w := range b.Wrappers {
+		n += len(w.Open) + len(w.Close)
+	}
+	return n
+}
 
 // BlockSeparator joins adjacent blocks. A blank line reproduces the paragraph
 // spacing a reader expects and is what upstream emitted between paragraphs.
@@ -88,16 +102,24 @@ const BlockSeparator = "\n\n"
 
 // Join concatenates blocks in order, separated by BlockSeparator. The result is
 // tag-balanced because every block is.
+//
+// Join and Chunk are the same packing with and without a size bound, so both go
+// through appendBlock and cannot disagree about separators.
 func Join(blocks []Block) string {
 	var sb strings.Builder
-	for i, b := range blocks {
-		html := b.HTML()
-		if i > 0 {
-			sb.WriteString(separatorAfter(sb.String(), BlockSeparator))
-		}
-		sb.WriteString(html)
+	for _, b := range blocks {
+		appendBlock(&sb, b)
 	}
 	return sb.String()
+}
+
+// appendBlock writes b into sb, preceded by whatever part of BlockSeparator sb
+// does not already end with. It is the single place blocks are concatenated.
+func appendBlock(sb *strings.Builder, b Block) {
+	if sb.Len() > 0 {
+		sb.WriteString(separatorAfter(sb.String(), BlockSeparator))
+	}
+	b.writeTo(sb)
 }
 
 // separatorAfter returns the part of sep still needed after prev.
@@ -150,17 +172,11 @@ const thematicBreakText = "——————————"
 // renderBlockNode renders one top-level node. The bool reports whether the node
 // produced a block at all — a node whose content is empty produces none.
 func renderBlockNode(src []byte, node ast.Node) (Block, bool, error) {
-	// Only a top-level code block carries wrappers. Nested in a list item or a
-	// quotation it renders inline, because a block's wrappers describe what
-	// encloses the block as a whole — that is what a split has to reopen.
+	if block, ok := wrappedBlockFor(src, node); ok {
+		return block, block.Len() > 0, nil
+	}
+
 	switch n := node.(type) {
-	case *ast.FencedCodeBlock:
-		return codeBlock(src, n, n.Language(src)), true, nil
-	case *ast.CodeBlock:
-		return codeBlock(src, n, nil), true, nil
-	case *east.Table:
-		block := renderTable(src, n)
-		return block, block.Content != "", nil
 	case *ast.Blockquote:
 		var sb strings.Builder
 		if err := writeChildBlocks(&sb, src, n, BlockSeparator); err != nil {
@@ -183,6 +199,26 @@ func renderBlockNode(src []byte, node ast.Node) (Block, bool, error) {
 		return Block{}, false, nil
 	}
 	return Block{Content: sb.String()}, true, nil
+}
+
+// wrappedBlockFor returns the Block for the node kinds that carry wrappers — the
+// enclosing elements a split has to close at the end of one chunk and reopen at
+// the start of the next.
+//
+// Both positions a block can appear in need it, which is why it is one function
+// rather than a case arm in each switch: at top level the Block is the block,
+// and nested inside a list item or a quotation its HTML goes into the enclosing
+// block's content, because wrappers describe what encloses a block as a whole.
+func wrappedBlockFor(src []byte, node ast.Node) (Block, bool) {
+	switch n := node.(type) {
+	case *ast.FencedCodeBlock:
+		return codeBlock(src, n, n.Language(src)), true
+	case *ast.CodeBlock:
+		return codeBlock(src, n, nil), true
+	case *east.Table:
+		return renderTable(src, n), true
+	}
+	return Block{}, false
 }
 
 // codeBlock builds a pre-wrapped code block. Telegram's subset nests code inside
@@ -217,6 +253,13 @@ func blockLines(src []byte, n ast.Node) string {
 // It recurses for constructs that contain other blocks, so a quotation holding a
 // list stays one block.
 func writeBlockContent(sb *strings.Builder, src []byte, node ast.Node) error {
+	// A wrapper-bearing kind nested inside another block puts its markup in the
+	// enclosing block's content rather than becoming a wrapper of its own.
+	if block, ok := wrappedBlockFor(src, node); ok {
+		block.writeTo(sb)
+		return nil
+	}
+
 	switch n := node.(type) {
 	case *ast.Heading:
 		// Telegram has no heading element and no way to carry a level, so every
@@ -237,21 +280,6 @@ func writeBlockContent(sb *strings.Builder, src []byte, node ast.Node) error {
 
 	case *ast.HTMLBlock:
 		return ErrRawHTML
-
-	case *ast.FencedCodeBlock:
-		sb.WriteString(codeBlock(src, n, n.Language(src)).HTML())
-		return nil
-
-	case *ast.CodeBlock:
-		sb.WriteString(codeBlock(src, n, nil).HTML())
-		return nil
-
-	case *east.Table:
-		// Nested inside another block, so the pre goes into the enclosing
-		// block's content rather than becoming a wrapper of its own — the same
-		// treatment a nested code block gets.
-		sb.WriteString(renderTable(src, n).HTML())
-		return nil
 
 	case *ast.Blockquote:
 		// A quotation reached here is nested inside another block — another
@@ -454,20 +482,34 @@ func renderInline(sb *strings.Builder, src []byte, node ast.Node) error {
 // anchor and blanked its href. An empty-href anchor is also a plausible Telegram
 // rejection, which would route the whole message to the plain-text fallback.
 func renderLink(sb *strings.Builder, src []byte, n *ast.Link) error {
-	if !schemeAllowed(n.Destination) {
+	var label strings.Builder
+	if err := renderInlineChildren(&label, src, n); err != nil {
+		return err
+	}
+	writeAnchor(sb, n.Destination, label.String())
+	return nil
+}
+
+// writeAnchor emits an anchor when dest's scheme is allowlisted, and the label
+// alone otherwise.
+//
+// Every construct that can carry a destination — link, autolink, image — goes
+// through here. The allowlist is the security-relevant decision in this package
+// and upstream's autolink handler bypassed its own copy of the check entirely,
+// so there is exactly one copy of it on the emitting side.
+func writeAnchor(sb *strings.Builder, dest []byte, label string) {
+	if !schemeAllowed(dest) {
 		// Label only. The destination is not emitted at all, in any form:
 		// Telegram autolinks visible text after parsing, so leaving a rejected
 		// destination in the text could hand it back a live link.
-		return renderInlineChildren(sb, src, n)
+		sb.WriteString(label)
+		return
 	}
 	sb.WriteString(`<a href="`)
-	sb.WriteString(escapeAttr(n.Destination))
+	sb.WriteString(escapeAttr(dest))
 	sb.WriteString(`">`)
-	if err := renderInlineChildren(sb, src, n); err != nil {
-		return err
-	}
+	sb.WriteString(label)
 	sb.WriteString(`</a>`)
-	return nil
 }
 
 // renderImage degrades an image to an anchor labelled with its alternative
@@ -477,54 +519,38 @@ func renderLink(sb *strings.Builder, src []byte, n *ast.Link) error {
 //
 // The destination goes through the same allowlist as a link: an image is a link
 // as far as Telegram is concerned once it is degraded, so R16 applies unchanged.
+// An image with neither an allowlisted destination nor alternative text emits
+// nothing: the destination is exactly what must not be shown, and a placeholder
+// would be text the author never wrote.
 func renderImage(sb *strings.Builder, src []byte, n *ast.Image) error {
 	var label strings.Builder
 	if err := renderInlineChildren(&label, src, n); err != nil {
 		return err
 	}
 
-	if !schemeAllowed(n.Destination) {
-		// Label only, destination dropped — R16. An image with neither an
-		// allowlisted destination nor alternative text carries nothing that can
-		// safely be shown: the destination is exactly what must not be emitted,
-		// and a placeholder would be text the author never wrote.
-		sb.WriteString(label.String())
-		return nil
-	}
-
 	text := label.String()
-	if text == "" {
+	if text == "" && schemeAllowed(n.Destination) {
 		// No alternative text to label the anchor with. The destination is
 		// allowlisted, so showing it is safe and is more useful than an empty
 		// anchor, which Telegram would render as nothing at all.
 		text = escapeText(n.Destination, true)
 	}
-	sb.WriteString(`<a href="`)
-	sb.WriteString(escapeAttr(n.Destination))
-	sb.WriteString(`">`)
-	sb.WriteString(text)
-	sb.WriteString(`</a>`)
+	writeAnchor(sb, n.Destination, text)
 	return nil
 }
 
 // renderAutoLink emits an anchor for a bracketed autolink. Upstream wrote the
 // href unconditionally, bypassing its scheme check entirely; this routes through
 // the same allowlist as an ordinary link.
+// A rejected autolink keeps its label, which is also its destination — there is
+// nothing else to fall back to, and it is no more reachable than the same string
+// written as ordinary prose.
 func renderAutoLink(sb *strings.Builder, src []byte, n *ast.AutoLink) error {
 	dest := n.URL(src)
 	if n.AutoLinkType == ast.AutoLinkEmail {
 		dest = emailDestination(dest)
 	}
-	label := escapeText(n.Label(src), true)
-	if !schemeAllowed(dest) {
-		sb.WriteString(label)
-		return nil
-	}
-	sb.WriteString(`<a href="`)
-	sb.WriteString(escapeAttr(dest))
-	sb.WriteString(`">`)
-	sb.WriteString(label)
-	sb.WriteString(`</a>`)
+	writeAnchor(sb, dest, escapeText(n.Label(src), true))
 	return nil
 }
 
@@ -593,6 +619,10 @@ func textContent(src []byte, n *ast.Text) string {
 	return escapeText(value, false)
 }
 
+// escapeGrowth is the headroom escapeText's buffer gets over its input, for the
+// few bytes an escape adds. Overflowing it costs a flush, not a wrong answer.
+const escapeGrowth = 16
+
 // escapeText converts markdown text content to Telegram-safe HTML text.
 //
 // Telegram documents exactly three characters as needing escapes in HTML parse
@@ -605,7 +635,11 @@ func textContent(src []byte, n *ast.Text) string {
 // references or unescaping backslash-escaped punctuation.
 func escapeText(value []byte, raw bool) string {
 	var buf bytes.Buffer
-	w := bufio.NewWriter(&buf)
+	// Sized to the segment, not to bufio's 4 KB default. A text node is usually
+	// a few dozen bytes, and this is the most-called allocation in the renderer:
+	// with the default size it accounted for the large majority of the bytes the
+	// whole render path allocated.
+	w := bufio.NewWriterSize(&buf, len(value)+escapeGrowth)
 	if raw {
 		html.DefaultWriter.RawWrite(w, value)
 	} else {

@@ -1149,9 +1149,13 @@ func TestRender_NestedOrderedListInsideBullet(t *testing.T) {
 	}
 }
 
-// KitchenSinkSource contains every construct fixed in this phase, together, so
-// the fixes are shown not to interfere with each other. Exported for the adapter
-// tests, which send this same document through the send path.
+// KitchenSinkSource contains every construct fixed alongside the renderer's
+// vendored-in defects, together, so the fixes are shown not to interfere with
+// each other.
+//
+// The adapter package keeps its own copy of this document rather than importing
+// it: an identifier declared in a _test.go file is not visible outside its own
+// test binary, so the two literals have to be edited together.
 const KitchenSinkSource = "Wrapped prose that runs across\ntwo source lines here.\n\n" +
 	"A hard break line  \nfollows immediately.\n\n" +
 	"---\n\n" +
@@ -1188,12 +1192,13 @@ func TestRender_KitchenSink(t *testing.T) {
 	}
 }
 
-// TypographySource is this phase's end-to-end document: a heading, a
+// TypographySource is the inline-and-block typography document: a heading, a
 // language-annotated fenced code block, a strikethrough span, an ordinary link
 // and a javascript: link, together. Each construct has its own case above; this
 // exists because they can each be right in isolation and interfere in sequence.
-// Exported for the adapter tests, which send the same document through the send
-// path.
+//
+// As with KitchenSinkSource, the adapter package keeps its own copy — a
+// _test.go identifier cannot be imported — so the two must be edited together.
 const TypographySource = "## Results\n\n" +
 	"The ~~old~~ new approach works. See [the docs](https://example.com/a_b) " +
 	"and do not follow [this one](javascript:alert(1)).\n\n" +

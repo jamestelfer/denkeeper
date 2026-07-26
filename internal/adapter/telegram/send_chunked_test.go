@@ -384,14 +384,14 @@ func TestSend_ExplicitParseModeIsNotChunked(t *testing.T) {
 // TestMessageChunkLimit_LeavesHeadroomBelowTelegramsCap pins the headroom
 // decision. The chunker counts raw HTML bytes while Telegram counts the
 // entity-stripped text in UTF-16 code units, so the count is conservative
-// already; the constant matches the activity log's own chunk size so the two
-// paths behave alike.
+// already, but it must still leave room under the cap.
+//
+// The constant also matches activityChunkMaxBytes in internal/agent, which is
+// unexported there and so cannot be asserted from here — that coupling is
+// documented at the constant and unenforced.
 func TestMessageChunkLimit_LeavesHeadroomBelowTelegramsCap(t *testing.T) {
 	const telegramCap = 4096
 	if messageChunkLimit >= telegramCap {
 		t.Errorf("messageChunkLimit = %d, want headroom below Telegram's %d", messageChunkLimit, telegramCap)
-	}
-	if messageChunkLimit != 3500 {
-		t.Errorf("messageChunkLimit = %d, want 3500 to match the activity log's chunk size", messageChunkLimit)
 	}
 }

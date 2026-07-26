@@ -29,31 +29,28 @@ func Chunk(blocks []Block, limit int) ([]string, error) {
 
 	var chunks []string
 	var active strings.Builder
+	active.Grow(limit)
 
 	flush := func() {
 		if active.Len() > 0 {
 			chunks = append(chunks, active.String())
 			active.Reset()
+			active.Grow(limit)
 		}
 	}
 
 	for _, b := range blocks {
-		html := b.HTML()
-		if html == "" {
+		size := b.Len()
+		if size == 0 {
 			continue
 		}
-		if active.Len() == 0 {
-			active.WriteString(html)
-			continue
+		if active.Len() > 0 {
+			sep := separatorAfter(active.String(), BlockSeparator)
+			if active.Len()+len(sep)+size > limit {
+				flush()
+			}
 		}
-		sep := separatorAfter(active.String(), BlockSeparator)
-		if active.Len()+len(sep)+len(html) <= limit {
-			active.WriteString(sep)
-			active.WriteString(html)
-			continue
-		}
-		flush()
-		active.WriteString(html)
+		appendBlock(&active, b)
 	}
 	flush()
 

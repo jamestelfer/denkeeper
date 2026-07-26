@@ -342,10 +342,8 @@ func (a *Adapter) Send(ctx context.Context, msg adapter.OutgoingMessage) error {
 	}
 
 	// Text reply (default path).
-	if _, err = a.sendText(chatID, msg); err != nil {
-		return err
-	}
-	return nil
+	_, err = a.sendText(chatID, msg)
+	return err
 }
 
 // parseModeHTML is Telegram's HTML parse mode identifier.
@@ -391,7 +389,7 @@ func (a *Adapter) sendText(chatID int64, msg adapter.OutgoingMessage) (int, erro
 	chunks, renderErr := renderChunks(msg.Text)
 	if renderErr != nil {
 		a.logger.Debug("render failed, sending as plain text", "error", renderErr)
-		return a.sendPlain(base, msg.Text, markup)
+		return a.sendPlain(base, markup)
 	}
 	if len(chunks) == 0 {
 		return 0, nil
@@ -411,7 +409,7 @@ func (a *Adapter) sendText(chatID int64, msg adapter.OutgoingMessage) (int, erro
 	// Telegram rejected the HTML. Retry the original markdown once with no parse
 	// mode — never a half-rendered string.
 	a.logger.Debug("html send failed, retrying as plain text", "error", err)
-	return a.sendPlain(base, msg.Text, markup)
+	return a.sendPlain(base, markup)
 }
 
 // sendChunks sends one Telegram message per chunk, in source order, and returns
@@ -436,10 +434,13 @@ func (a *Adapter) sendChunks(base tgbotapi.MessageConfig, markup interface{}, ch
 	return lastID, nil
 }
 
-// sendPlain sends text with no parse mode — the fallback both R29 and R30 land
-// on. It always carries the original markdown, never a half-rendered string.
-func (a *Adapter) sendPlain(base tgbotapi.MessageConfig, text string, markup interface{}) (int, error) {
-	base.Text = text
+// sendPlain sends base with no parse mode — the fallback both R29 and R30 land
+// on.
+//
+// base.Text is still the original markdown: sendText builds it from
+// msg.Text and sendChunks mutates only its own copy, so the fallback cannot
+// carry a half-rendered string.
+func (a *Adapter) sendPlain(base tgbotapi.MessageConfig, markup interface{}) (int, error) {
 	base.ParseMode = ""
 	base.ReplyMarkup = markup
 	return a.sendOne(base)

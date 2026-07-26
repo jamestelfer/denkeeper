@@ -5,8 +5,10 @@
 package tghtml
 
 import (
+	"slices"
 	"strings"
 	"text/tabwriter"
+	"unicode/utf8"
 
 	"github.com/yuin/goldmark/ast"
 	east "github.com/yuin/goldmark/extension/ast"
@@ -22,11 +24,11 @@ import (
 // the column bar; the leading space on every cell after the first turns its
 // "a |b" into "a | b".
 const (
-	tablePadding  = 1
-	tablePadChar  = ' '
+	// tablePadding is the space tabwriter adds after each cell before its bar.
+	tablePadding = 1
+	// tableCellLead is prepended to every cell after the first, so the bar
+	// tabwriter.Debug draws is followed by a space as well as preceded by one.
 	tableCellLead = " "
-	tableRuleFill = '-'
-	tableRuleJoin = '+'
 )
 
 // renderTable degrades a GFM table to a preformatted block with fixed-width
@@ -53,7 +55,7 @@ func renderTable(src []byte, table *east.Table) Block {
 		// derived from the formatted header line rather than from the column
 		// widths, so its junctions cannot drift out of line with the bars above
 		// and below it.
-		lines = append(lines[:1], append([]string{headerRule(lines)}, lines[1:]...)...)
+		lines = slices.Insert(lines, 1, headerRule(lines))
 	}
 
 	return Block{
@@ -65,7 +67,7 @@ func renderTable(src []byte, table *east.Table) Block {
 // layoutRows aligns every row's cells into fixed-width columns.
 func layoutRows(rows [][]string) []string {
 	var buf strings.Builder
-	w := tabwriter.NewWriter(&buf, 0, 0, tablePadding, tablePadChar, tabwriter.Debug)
+	w := tabwriter.NewWriter(&buf, 0, 0, tablePadding, ' ', tabwriter.Debug)
 	for _, row := range rows {
 		cells := make([]string, len(row))
 		for i, cell := range row {
@@ -83,7 +85,7 @@ func layoutRows(rows [][]string) []string {
 	for i, line := range lines {
 		// tabwriter pads the final cell of a line when a later row is wider.
 		// Trailing spaces are invisible and only cost message budget.
-		lines[i] = strings.TrimRight(line, string(tablePadChar))
+		lines[i] = strings.TrimRight(line, " ")
 	}
 	return lines
 }
@@ -94,19 +96,19 @@ func layoutRows(rows [][]string) []string {
 func headerRule(lines []string) string {
 	rule := strings.Map(func(r rune) rune {
 		if r == '|' {
-			return tableRuleJoin
+			return '+'
 		}
-		return tableRuleFill
+		return '-'
 	}, lines[0])
 
 	widest := 0
 	for _, line := range lines {
-		if n := len([]rune(line)); n > widest {
+		if n := utf8.RuneCountInString(line); n > widest {
 			widest = n
 		}
 	}
-	if pad := widest - len([]rune(rule)); pad > 0 {
-		rule += strings.Repeat(string(tableRuleFill), pad)
+	if pad := widest - utf8.RuneCountInString(rule); pad > 0 {
+		rule += strings.Repeat("-", pad)
 	}
 	return rule
 }
@@ -115,11 +117,11 @@ func headerRule(lines []string) string {
 func tableRows(src []byte, table *east.Table) [][]string {
 	var rows [][]string
 	for node := table.FirstChild(); node != nil; node = node.NextSibling() {
-		switch row := node.(type) {
-		case *east.TableHeader:
-			rows = append(rows, tableCells(src, row))
-		case *east.TableRow:
-			rows = append(rows, tableCells(src, row))
+		// A header row and a body row are laid out identically; only the rule
+		// drawn after the first row distinguishes them.
+		switch node.(type) {
+		case *east.TableHeader, *east.TableRow:
+			rows = append(rows, tableCells(src, node))
 		}
 	}
 	return rows
@@ -142,20 +144,15 @@ func tableCells(src []byte, row ast.Node) []string {
 // cellText returns one cell's plain text, with the characters tabwriter reserves
 // removed. A tab inside a cell would open a phantom column; a newline would end
 // the row.
+//
+// Character references and backslash escapes are left as the source wrote them;
+// HTML escaping is applied later, over the whole assembled grid.
 func cellText(src []byte, cell ast.Node) string {
-	text := inlineText(src, cell)
-	text = strings.ReplaceAll(text, "\t", " ")
+	var sb strings.Builder
+	collectText(&sb, src, cell)
+	text := strings.ReplaceAll(sb.String(), "\t", " ")
 	text = strings.ReplaceAll(text, "\n", " ")
 	return strings.TrimSpace(text)
-}
-
-// inlineText returns a node's text content with no markup at all. Character
-// references and backslash escapes are left as the source wrote them; HTML
-// escaping is applied later, over the whole assembled grid.
-func inlineText(src []byte, node ast.Node) string {
-	var sb strings.Builder
-	collectText(&sb, src, node)
-	return sb.String()
 }
 
 func collectText(sb *strings.Builder, src []byte, node ast.Node) {
