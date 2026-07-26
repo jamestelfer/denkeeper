@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
@@ -423,7 +424,12 @@ func (a *Adapter) sendText(chatID int64, msg adapter.OutgoingMessage) (int, erro
 	// markdown as a single message, so a source over Telegram's hard cap is
 	// rejected outright however it is escaped — attempting it spends a round trip
 	// on a certain failure and buries the real error behind the second one.
-	if delivered > 0 || len(msg.Text) > telegramMessageCap {
+	//
+	// Measured in characters, which is the unit the cap is expressed in. A byte
+	// count is the same number only for ASCII and overstates every other reply:
+	// a Japanese one runs three bytes to the character, so it would be called
+	// oversized at a third of the cap and denied a retry that would have worked.
+	if delivered > 0 || utf8.RuneCountInString(msg.Text) > telegramMessageCap {
 		return 0, err
 	}
 

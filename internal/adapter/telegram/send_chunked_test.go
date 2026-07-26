@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
@@ -452,5 +453,60 @@ func TestMessageChunkLimit_LeavesHeadroomBelowTelegramsCap(t *testing.T) {
 	const telegramCap = 4096
 	if MessageChunkLimit >= telegramCap {
 		t.Errorf("MessageChunkLimit = %d, want headroom below Telegram's %d", MessageChunkLimit, telegramCap)
+	}
+}
+
+// multiByteReplyUnderCap builds a reply that fits in one Telegram message and
+// does not fit in 4096 bytes. Telegram counts characters, so the two are only
+// the same string for ASCII.
+//
+// Both halves are asserted here so the fixture cannot drift into testing
+// nothing: an ASCII reply would satisfy the test for the wrong reason.
+func multiByteReplyUnderCap(t *testing.T) string {
+	t.Helper()
+	// Japanese: three bytes per character, so 1500 characters is 4500 bytes.
+	src := strings.TrimSpace(strings.Repeat("こんにちは世界。これはテストです。\n", 100))
+	if n := utf8.RuneCountInString(src); n > telegramMessageCap {
+		t.Fatalf("fixture is %d characters, want at most %d so one message can hold it", n, telegramMessageCap)
+	}
+	if len(src) <= telegramMessageCap {
+		t.Fatalf("fixture is %d bytes, want over %d so a byte-counted cap would reject it", len(src), telegramMessageCap)
+	}
+	return src
+}
+
+// TestSend_MultiByteReplyUnderTheCapRetriesPlainText pins what the futility
+// check in R30 is actually asking.
+//
+// The question is whether the original markdown could go out as one message,
+// and Telegram answers it in characters of the entity-stripped text — the unit
+// telegramMessageCap is documented in. Measuring the source in bytes instead
+// answers a different question, and answers it wrongly for every reply that is
+// not ASCII: a Japanese reply well inside the cap looks oversized, so the retry
+// that would have succeeded is never attempted and the reply is lost.
+func TestSend_MultiByteReplyUnderTheCapRetriesPlainText(t *testing.T) {
+	bot := newFakeBot().failOnSend(1)
+	a := newWithSender(bot, nil, testLogger(), nil)
+
+	src := multiByteReplyUnderCap(t)
+	if err := a.Send(context.Background(), adapter.OutgoingMessage{
+		ExternalID: "12345",
+		Text:       src,
+	}); err != nil {
+		t.Fatalf("Send: %v — the plain-text retry should have carried the reply", err)
+	}
+
+	msgs := bot.messages(t)
+	if len(msgs) != 2 {
+		t.Fatalf("send count = %d, want 2 — the failed HTML attempt and one plain-text retry", len(msgs))
+	}
+	if msgs[0].ParseMode != parseModeHTML {
+		t.Errorf("first ParseMode = %q, want %q", msgs[0].ParseMode, parseModeHTML)
+	}
+	if msgs[1].ParseMode != "" {
+		t.Errorf("retry ParseMode = %q, want empty — the retry carries no markup", msgs[1].ParseMode)
+	}
+	if msgs[1].Text != src {
+		t.Errorf("retry text = %q, want the original markdown", msgs[1].Text)
 	}
 }
