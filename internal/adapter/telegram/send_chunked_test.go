@@ -302,29 +302,92 @@ func TestSendAndGetID_EmptyRenderIsAnError(t *testing.T) {
 	}
 }
 
-// TestSend_ChunkedReplyDoesNotRetryPlainText pins how R30 and R31 divide.
+// TestSend_OversizedReplyDoesNotRetryPlainText pins the futility half of the
+// retry rule.
 //
-// The plain-text retry replaces the whole message, so on a multi-chunk send it
-// would re-deliver the chunks that already arrived. R30's retry therefore
-// applies only where the reply is a single message; beyond that R31 governs and
-// a failure aborts.
-func TestSend_ChunkedReplyDoesNotRetryPlainText(t *testing.T) {
+// Nothing was delivered here — the very first chunk failed — so R31 is not what
+// stops the retry. What stops it is that the retry sends the original markdown
+// as one message, and this reply's source is several times Telegram's 4096-char
+// cap. The API would reject it on sight, so the round trip buys nothing and
+// replaces the real error with a second, less useful one.
+func TestSend_OversizedReplyDoesNotRetryPlainText(t *testing.T) {
 	bot := newFakeBot().failOnSend(1)
 	a := newWithSender(bot, nil, testLogger(), nil)
 
+	src := longReply(60)
+	if len(src) <= telegramMessageCap {
+		t.Fatalf("fixture source is %d bytes, want over %d so the retry is genuinely futile", len(src), telegramMessageCap)
+	}
 	if err := a.Send(context.Background(), adapter.OutgoingMessage{
 		ExternalID: "12345",
-		Text:       longReply(60),
+		Text:       src,
 	}); err == nil {
 		t.Fatal("expected the failure to surface as an error")
 	}
 
 	msgs := bot.messages(t)
 	if len(msgs) != 1 {
-		t.Fatalf("send count = %d, want exactly 1 — no plain-text retry on a chunked reply", len(msgs))
+		t.Fatalf("send count = %d, want exactly 1 — a reply that cannot fit in one message is not retried", len(msgs))
 	}
 	if msgs[0].ParseMode != "HTML" {
 		t.Errorf("ParseMode = %q, want HTML — the single attempt is the HTML one", msgs[0].ParseMode)
+	}
+}
+
+// twoChunkReplyUnderCap builds the reply the retry rule turns on: markup
+// inflates the rendered HTML past the chunk limit, so it splits, yet the source
+// markdown still fits inside one Telegram message.
+//
+// Both halves are asserted here rather than in the test. A fixture that drifted
+// to three chunks, or past the cap, would leave the test green while it stopped
+// exercising the case it was written for.
+func twoChunkReplyUnderCap(t *testing.T) string {
+	t.Helper()
+	src := longReply(45)
+	if len(src) > telegramMessageCap {
+		t.Fatalf("fixture source is %d bytes, want at most %d so the plain retry can fit in one message", len(src), telegramMessageCap)
+	}
+	chunks, err := renderChunks(src)
+	if err != nil {
+		t.Fatalf("renderChunks: %v", err)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("fixture renders to %d chunks, want 2", len(chunks))
+	}
+	return src
+}
+
+// TestSend_FirstChunkFailureRetriesPlainTextWhenTheSourceFits covers the case
+// the chunk count alone gets wrong.
+//
+// The reply chunks, but the failure landed on chunk one, so the chat is
+// untouched and R31 has no partial delivery to protect. The source is under
+// Telegram's cap, so the single-message retry can actually land. Both conditions
+// hold, so R30's fallback applies exactly as it would to a short reply.
+func TestSend_FirstChunkFailureRetriesPlainTextWhenTheSourceFits(t *testing.T) {
+	bot := newFakeBot().failOnSend(1)
+	a := newWithSender(bot, nil, testLogger(), nil)
+
+	src := twoChunkReplyUnderCap(t)
+	if err := a.Send(context.Background(), adapter.OutgoingMessage{
+		ExternalID: "12345",
+		Text:       src,
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	msgs := bot.messages(t)
+	if len(msgs) != 2 {
+		t.Fatalf("send count = %d, want exactly 2 — the HTML attempt and one plain-text retry", len(msgs))
+	}
+	if msgs[0].ParseMode != "HTML" {
+		t.Errorf("first attempt ParseMode = %q, want HTML", msgs[0].ParseMode)
+	}
+	if msgs[1].ParseMode != "" {
+		t.Errorf("retry ParseMode = %q, want empty — the retry carries no markup", msgs[1].ParseMode)
+	}
+	if msgs[1].Text != src {
+		t.Error("retry text is not the original markdown")
 	}
 }
 

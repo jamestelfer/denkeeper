@@ -640,6 +640,34 @@ func TestRender_TableRuleSpansTheWidestRow(t *testing.T) {
 	}
 }
 
+// TestRender_TableCellsWithLinksCarryTheirTextOnce covers the link forms in a
+// cell, which the rest of the table cases do not reach.
+//
+// Both link forms and a code span reduce to their text: a cell that emitted an
+// anchor would put bytes of no display width into the grid and break the column
+// arithmetic, and a cell that wrote its text twice would silently widen its
+// column — which reads as an alignment bug rather than a duplication one.
+func TestRender_TableCellsWithLinksCarryTheirTextOnce(t *testing.T) {
+	src := "| kind | value |\n" +
+		"|------|-------|\n" +
+		"| autolink | <https://example.com/a_b> |\n" +
+		"| inline | [label](https://example.com/c_d) |\n" +
+		"| code | `snake_case` |\n"
+
+	got := renderOne(t, src)
+
+	for _, once := range []string{"https://example.com/a_b", "label", "snake_case"} {
+		if n := strings.Count(got, once); n != 1 {
+			t.Errorf("Render() = %q\n%q appears %d times, want exactly once", got, once, n)
+		}
+	}
+	// A cell is text, so neither link form may bring markup into the pre block.
+	if strings.Contains(got, "<a") {
+		t.Errorf("Render() = %q — a cell must carry no anchor", got)
+	}
+	assertTagBalanced(t, got)
+}
+
 // TestRender_PipesInProseDoNotBecomeATable guards the parsing change enabling
 // the Table extension makes to every input, not just to tables.
 func TestRender_PipesInProseDoNotBecomeATable(t *testing.T) {

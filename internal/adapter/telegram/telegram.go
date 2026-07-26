@@ -362,6 +362,15 @@ const parseModeHTML = "HTML"
 // nothing tied them together.
 const MessageChunkLimit = 3500
 
+// telegramMessageCap is Telegram's own hard limit on a single message, in
+// characters of the entity-stripped text.
+//
+// Distinct from MessageChunkLimit, which is the deliberately conservative bound
+// the chunker splits on. This one is the API's documented ceiling, and it is
+// used to answer a different question: whether a given string has any chance of
+// going out as one message at all.
+const telegramMessageCap = 4096
+
 // sendText renders msg's text and delivers it, returning the message ID of the
 // last message sent. It is the shared body of Send and SendAndGetID, so the two
 // cannot drift in how they render, chunk, fall back or abort.
@@ -398,19 +407,28 @@ func (a *Adapter) sendText(chatID int64, msg adapter.OutgoingMessage) (int, erro
 		return 0, nil
 	}
 
-	id, err := a.sendChunks(base, markup, chunks)
+	id, delivered, err := a.sendChunks(base, markup, chunks)
 	if err == nil {
 		return id, nil
 	}
-	if len(chunks) > 1 {
-		// R31: a chunk failed, so the rest are abandoned. The plain-text retry
-		// replaces the whole message, which would re-deliver the chunks that
-		// already arrived, so it does not apply beyond a single-message reply.
+
+	// Where R30's retry ends and R31 begins is decided by what already reached
+	// the chat, not by how many chunks the reply happened to split into. The
+	// retry re-sends the whole reply as one message, so it is only safe while
+	// nothing has landed: once a chunk has arrived, repeating it would leave the
+	// reader with a duplicated fragment, which reads worse than the visible
+	// failure R31 asks for.
+	//
+	// The retry also has to be capable of succeeding. It sends the original
+	// markdown as a single message, so a source over Telegram's hard cap is
+	// rejected outright however it is escaped — attempting it spends a round trip
+	// on a certain failure and buries the real error behind the second one.
+	if delivered > 0 || len(msg.Text) > telegramMessageCap {
 		return 0, err
 	}
 
-	// Telegram rejected the HTML. Retry the original markdown once with no parse
-	// mode — never a half-rendered string.
+	// Telegram rejected the HTML and nothing is on screen yet. Retry the original
+	// markdown once with no parse mode — never a half-rendered string.
 	a.logger.Debug("html send failed, retrying as plain text", "error", err)
 	return a.sendPlain(base, markup)
 }
@@ -418,8 +436,12 @@ func (a *Adapter) sendText(chatID int64, msg adapter.OutgoingMessage) (int, erro
 // sendChunks sends one Telegram message per chunk, in source order, and returns
 // the final chunk's message ID. The inline keyboard rides on the final chunk
 // only: buttons under a mid-message fragment read as a broken message.
-func (a *Adapter) sendChunks(base tgbotapi.MessageConfig, markup interface{}, chunks []string) (int, error) {
-	var lastID int
+//
+// The second return is how many chunks actually reached the chat. On failure it
+// is what tells the caller whether the reply is still recoverable — a failure on
+// the first chunk left the conversation untouched, a later one did not — so the
+// error alone is not enough to decide.
+func (a *Adapter) sendChunks(base tgbotapi.MessageConfig, markup interface{}, chunks []string) (id, delivered int, err error) {
 	for i, chunk := range chunks {
 		out := base
 		out.Text = chunk
@@ -428,13 +450,13 @@ func (a *Adapter) sendChunks(base tgbotapi.MessageConfig, markup interface{}, ch
 		if i == len(chunks)-1 {
 			out.ReplyMarkup = markup
 		}
-		sent, err := a.sender.Send(out)
-		if err != nil {
-			return 0, fmt.Errorf("sending telegram message chunk %d of %d: %w", i+1, len(chunks), err)
+		sent, sendErr := a.sender.Send(out)
+		if sendErr != nil {
+			return 0, i, fmt.Errorf("sending telegram message chunk %d of %d: %w", i+1, len(chunks), sendErr)
 		}
-		lastID = sent.MessageID
+		id = sent.MessageID
 	}
-	return lastID, nil
+	return id, len(chunks), nil
 }
 
 // sendPlain sends base with no parse mode — the fallback both R29 and R30 land

@@ -155,24 +155,37 @@ func cellText(src []byte, cell ast.Node) string {
 	return strings.TrimSpace(text)
 }
 
+// collectText appends the text of every leaf under node, in source order.
+//
+// Only the three text-bearing leaves contribute; every other node is walked
+// through for its children. All three are leaves in goldmark's AST — an
+// AutoLink keeps its text in a field rather than a child — so SkipChildren is
+// a statement of intent rather than a behavioural necessity: whatever these
+// nodes hold, their own accessor is the whole of their text.
 func collectText(sb *strings.Builder, src []byte, node ast.Node) {
-	switch n := node.(type) {
-	case *ast.Text:
-		sb.Write(n.Segment.Value(src))
-		if n.HardLineBreak() || n.SoftLineBreak() {
-			// A line break inside a cell would break the grid, so it becomes a
-			// space. The cell's words stay separated, which is what matters.
-			sb.WriteByte(' ')
+	// ast.Walk's only error is one the walker itself returns, and this walker
+	// never does.
+	_ = ast.Walk(node, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
 		}
-		return
-	case *ast.String:
-		sb.Write(n.Value)
-		return
-	case *ast.AutoLink:
-		sb.Write(n.Label(src))
-		return
-	}
-	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
-		collectText(sb, src, child)
-	}
+		switch n := n.(type) {
+		case *ast.Text:
+			sb.Write(n.Segment.Value(src))
+			if n.HardLineBreak() || n.SoftLineBreak() {
+				// A line break inside a cell would break the grid, so it becomes
+				// a space. The cell's words stay separated, which is what
+				// matters.
+				sb.WriteByte(' ')
+			}
+			return ast.WalkSkipChildren, nil
+		case *ast.String:
+			sb.Write(n.Value)
+			return ast.WalkSkipChildren, nil
+		case *ast.AutoLink:
+			sb.Write(n.Label(src))
+			return ast.WalkSkipChildren, nil
+		}
+		return ast.WalkContinue, nil
+	})
 }
