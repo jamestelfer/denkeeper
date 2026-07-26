@@ -23,10 +23,24 @@ import (
 
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/extension"
+	east "github.com/yuin/goldmark/extension/ast"
 	"github.com/yuin/goldmark/renderer/html"
 	"github.com/yuin/goldmark/text"
 	"github.com/yuin/goldmark/util"
 )
+
+// mdParser parses CommonMark plus the individual extensions this renderer
+// needs.
+//
+// Extensions are selected one at a time rather than through extension.GFM.
+// GFM bundles linkify, which wraps bare URLs in anchors — including the
+// underscore-bearing URLs of the defect this package exists to fix. Today those
+// travel as plain text and Telegram autolinks them after parsing, which is the
+// behaviour the regression test pins.
+var mdParser = goldmark.New(
+	goldmark.WithExtensions(extension.Strikethrough),
+).Parser()
 
 // Wrapper is an element that encloses a block's content. A block's wrappers are
 // ordered outermost first, so a fenced code block carries {<pre>}, {<code>}.
@@ -75,11 +89,29 @@ const BlockSeparator = "\n\n"
 // Join concatenates blocks in order, separated by BlockSeparator. The result is
 // tag-balanced because every block is.
 func Join(blocks []Block) string {
-	parts := make([]string, 0, len(blocks))
-	for _, b := range blocks {
-		parts = append(parts, b.HTML())
+	var sb strings.Builder
+	for i, b := range blocks {
+		html := b.HTML()
+		if i > 0 {
+			sb.WriteString(separatorAfter(sb.String(), BlockSeparator))
+		}
+		sb.WriteString(html)
 	}
-	return strings.Join(parts, BlockSeparator)
+	return sb.String()
+}
+
+// separatorAfter returns the part of sep still needed after prev.
+//
+// A block may end in a newline of its own — a heading does, because R14 makes
+// the line break part of the heading. Writing the full separator on top of it
+// would open a second blank line, so the newlines prev already contributed are
+// deducted. sep is always a run of newlines.
+func separatorAfter(prev, sep string) string {
+	trailing := len(prev) - len(strings.TrimRight(prev, "\n"))
+	if trailing > len(sep) {
+		trailing = len(sep)
+	}
+	return sep[trailing:]
 }
 
 // Render parses src as CommonMark and returns its Telegram-HTML blocks in
@@ -89,7 +121,7 @@ func Join(blocks []Block) string {
 // Render returns an error only for constructs Telegram's HTML subset cannot
 // represent at all — see UnsupportedError.
 func Render(src []byte) ([]Block, error) {
-	doc := goldmark.DefaultParser().Parse(text.NewReader(src))
+	doc := mdParser.Parse(text.NewReader(src))
 
 	var blocks []Block
 	for node := doc.FirstChild(); node != nil; node = node.NextSibling() {
@@ -184,12 +216,16 @@ func blockLines(src []byte, n ast.Node) string {
 func writeBlockContent(sb *strings.Builder, src []byte, node ast.Node) error {
 	switch n := node.(type) {
 	case *ast.Heading:
-		// Telegram has no heading element, so every level renders bold.
+		// Telegram has no heading element and no way to carry a level, so every
+		// level renders bold. The trailing newline is part of the requirement:
+		// without it a heading runs into the following sentence wherever the
+		// surrounding joiner is not itself a line break. Join collapses its
+		// separator against this newline so the gap stays one blank line.
 		sb.WriteString("<b>")
 		if err := renderInlineChildren(sb, src, n); err != nil {
 			return err
 		}
-		sb.WriteString("</b>")
+		sb.WriteString("</b>\n")
 		return nil
 
 	case *ast.ThematicBreak:
@@ -264,7 +300,7 @@ func writeList(sb *strings.Builder, src []byte, list *ast.List, depth int) error
 			continue
 		}
 		if !first {
-			sb.WriteString("\n")
+			sb.WriteString(separatorAfter(sb.String(), "\n"))
 		}
 		sb.WriteString(indent)
 		if list.IsOrdered() {
@@ -307,14 +343,14 @@ func writeListItem(sb *strings.Builder, src []byte, item ast.Node, depth int) er
 			continue
 		}
 		if text.Len() > 0 {
-			text.WriteString("\n")
+			text.WriteString(separatorAfter(text.String(), "\n"))
 		}
 		text.WriteString(part.String())
 	}
 
 	sb.WriteString(text.String())
 	for _, n := range nested {
-		sb.WriteString("\n")
+		sb.WriteString(separatorAfter(sb.String(), "\n"))
 		sb.WriteString(n)
 	}
 	return nil
@@ -341,7 +377,7 @@ func writeChildBlocks(sb *strings.Builder, src []byte, node ast.Node, sep string
 			continue
 		}
 		if !first {
-			sb.WriteString(sep)
+			sb.WriteString(separatorAfter(sb.String(), sep))
 		}
 		sb.WriteString(inner.String())
 		first = false
@@ -375,6 +411,14 @@ func renderInline(sb *strings.Builder, src []byte, node ast.Node) error {
 		return nil
 	case *ast.Emphasis:
 		return renderEmphasis(sb, src, n)
+	case *east.Strikethrough:
+		// Telegram's subset spells strikethrough <s>; it has no <del>.
+		sb.WriteString("<s>")
+		if err := renderInlineChildren(sb, src, n); err != nil {
+			return err
+		}
+		sb.WriteString("</s>")
+		return nil
 	case *ast.CodeSpan:
 		renderCodeSpan(sb, src, n)
 		return nil

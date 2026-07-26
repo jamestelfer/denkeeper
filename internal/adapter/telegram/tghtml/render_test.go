@@ -135,6 +135,44 @@ func TestRender_Emphasis(t *testing.T) {
 	}
 }
 
+// TestRender_Strikethrough covers R10. Telegram's subset spells strikethrough
+// <s>; goldmark's CommonMark core has no strikethrough at all, so the
+// Strikethrough extension has to be selected on the parser. It is selected
+// individually rather than through extension.GFM, which also bundles linkify —
+// that would wrap the bare underscore-bearing URLs of the originating defect in
+// anchors.
+func TestRender_Strikethrough(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"whole paragraph", "~~struck~~", "<s>struck</s>"},
+		{"span in prose", "a ~~b~~ c", "a <s>b</s> c"},
+		{"nested emphasis inside", "~~struck *and italic*~~", "<s>struck <i>and italic</i></s>"},
+		// GFM matches a pair of one *or* two tildes, so a single tilde is also
+		// strikethrough. An unmatched tilde stays literal.
+		{"single tilde pair", "a ~b~ c", "a <s>b</s> c"},
+		{"unmatched tilde is literal", "a ~ b c", "a ~ b c"},
+		// Enabling the extension puts every tilde in ordinary prose at risk of
+		// pairing into a strikethrough span. GFM's flanking rules prevent it, and
+		// home-directory paths and approximations are common enough in agent
+		// output that the property is worth pinning rather than assuming.
+		{"home directory paths do not pair", "cd ~/foo and ~/bar", "cd ~/foo and ~/bar"},
+		{"dotfile path", "the file ~/.bashrc is there", "the file ~/.bashrc is there"},
+		{"approximations do not pair", "approx ~5 to ~10 items", "approx ~5 to ~10 items"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := renderOne(t, tc.src)
+			if got != tc.want {
+				t.Errorf("Render(%q) = %q, want %q", tc.src, got, tc.want)
+			}
+			assertTagBalanced(t, got)
+		})
+	}
+}
+
 func TestRender_CodeSpan(t *testing.T) {
 	cases := []struct {
 		name string
@@ -243,6 +281,89 @@ func TestRender_LinkWithRejectedSchemeDropsTheAnchor(t *testing.T) {
 	}
 }
 
+// TestRender_HostileSchemesAreRejected is R16's adversarial half. Upstream's
+// denylist was measured passing "JaVaScRiPt:alert(1)" straight into an href, so
+// these are the shapes an allowlist has to survive: case variation, padding,
+// embedded control characters, and a scheme split across a line.
+//
+// CommonMark strips whitespace from a bracketed destination, so the padded and
+// line-broken forms have to be built with angle-bracket destinations, which
+// preserve the inner bytes.
+func TestRender_HostileSchemesAreRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		bad  string // a substring that must not survive into the output
+		// notALink marks a source CommonMark refuses to parse as a link at all,
+		// so the destination never reaches the scheme check. It survives as
+		// ordinary prose, which is correct — the renderer emits any other
+		// javascript: string in prose verbatim too. Only the anchor matters.
+		notALink bool
+	}{
+		{name: "case varied", src: "[click](JaVaScRiPt:alert(1))", bad: "alert(1)"},
+		{name: "all caps", src: "[click](JAVASCRIPT:alert(1))", bad: "alert(1)"},
+		{name: "leading space", src: "[click](< javascript:alert(1)>)", bad: "alert(1)"},
+		{name: "inner space", src: "[click](<java script:alert(1)>)", bad: "alert(1)"},
+		{name: "tab inside the scheme", src: "[click](<java\tscript:alert(1)>)", bad: "alert(1)"},
+		{name: "newline inside the scheme", src: "[click](<java\nscript:alert(1)>)", bad: "alert(1)", notALink: true},
+		{name: "leading null byte", src: "[click](<\x00javascript:alert(1)>)", bad: "alert(1)"},
+		{name: "leading delete byte", src: "[click](<\x7fjavascript:alert(1)>)", bad: "alert(1)"},
+		{name: "scheme-relative", src: "[click](//evil.example.com/x)", bad: "evil.example.com"},
+		{name: "relative path", src: "[click](/local/path)", bad: "/local/path"},
+		{name: "bare word", src: "[click](notascheme)", bad: "notascheme"},
+		{name: "empty scheme", src: "[click](<:nohost>)", bad: ":nohost"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := renderOne(t, tc.src)
+			if strings.Contains(got, "<a") {
+				t.Errorf("Render(%q) = %q — must emit no anchor element", tc.src, got)
+			}
+			if strings.Contains(got, "href") {
+				t.Errorf("Render(%q) = %q — must emit no href", tc.src, got)
+			}
+			if !tc.notALink && strings.Contains(got, tc.bad) {
+				t.Errorf("Render(%q) = %q — %q must not reach the output", tc.src, got, tc.bad)
+			}
+			if !strings.Contains(got, "click") {
+				t.Errorf("Render(%q) = %q — the label must survive", tc.src, got)
+			}
+			assertTagBalanced(t, got)
+		})
+	}
+}
+
+// TestRender_AutoLinkGoesThroughTheAllowlist covers the path upstream skipped
+// entirely: its autolink renderer wrote the href unconditionally, bypassing its
+// own scheme check.
+//
+// A rejected autolink keeps its label as escaped text, because for an autolink
+// the label *is* the destination and there is nothing else to fall back to.
+// That is no worse than the same string appearing as ordinary prose, which the
+// renderer already emits verbatim — and Telegram does not autolink a
+// javascript: scheme in plain text.
+func TestRender_AutoLinkGoesThroughTheAllowlist(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"https autolink", "<https://example.com/a_b>", `<a href="https://example.com/a_b">https://example.com/a_b</a>`},
+		{"email autolink", "<a@example.com>", `<a href="mailto:a@example.com">a@example.com</a>`},
+		{"javascript autolink", "<javascript:alert(1)>", "javascript:alert(1)"},
+		{"file autolink", "<file:///etc/passwd>", "file:///etc/passwd"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := renderOne(t, tc.src)
+			if got != tc.want {
+				t.Errorf("Render(%q) = %q, want %q", tc.src, got, tc.want)
+			}
+			assertTagBalanced(t, got)
+		})
+	}
+}
+
 // TestRender_RawHTMLFailsClosed covers R15. Raw HTML is the only fail-closed
 // case in this package: it has no representable form in Telegram's subset, and
 // forwarding it would let the source inject markup we never validated.
@@ -308,13 +429,59 @@ func TestRender_ParagraphsBecomeSeparateBlocks(t *testing.T) {
 	}
 }
 
-// TestRender_HeadingIsBold covers Telegram's lack of a heading element.
-func TestRender_HeadingIsBold(t *testing.T) {
-	for _, src := range []string{"# Title", "## Title", "###### Title"} {
-		if got := renderOne(t, src); got != "<b>Title</b>" {
-			t.Errorf("Render(%q) = %q, want %q", src, got, "<b>Title</b>")
+// TestRender_HeadingIsBoldFollowedByLineBreak covers R14. Telegram's subset has
+// no heading element and no way to express a level, so every level renders bold
+// — and the line break is part of the requirement, because a heading that runs
+// into the next sentence is not recognisable as a heading at all.
+func TestRender_HeadingIsBoldFollowedByLineBreak(t *testing.T) {
+	for _, src := range []string{"# Title", "## Title", "###### Title", "Title\n=====", "Title\n-----"} {
+		got := renderOne(t, src)
+		if got != "<b>Title</b>\n" {
+			t.Errorf("Render(%q) = %q, want %q", src, got, "<b>Title</b>\n")
 		}
+		assertTagBalanced(t, got)
 	}
+}
+
+// TestRender_HeadingIsSeparatedFromFollowingProseByOneBlankLine pins the
+// interaction between R14's line break and the block separator. The heading
+// carries its own newline, so the joiner must not add a second one on top of it
+// — two blank lines between a heading and its first sentence reads as a gap,
+// not as a heading.
+func TestRender_HeadingIsSeparatedFromFollowingProseByOneBlankLine(t *testing.T) {
+	blocks, err := Render([]byte("# Title\n\nBody text."))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	got := Join(blocks)
+	want := "<b>Title</b>\n\nBody text."
+	if got != want {
+		t.Errorf("Join() = %q, want %q", got, want)
+	}
+}
+
+// TestRender_HeadingInsideBlockquoteKeepsItsLineBreak checks R14 holds where the
+// heading is not a top-level block and the surrounding joiner is a single
+// newline rather than a blank line.
+func TestRender_HeadingInsideBlockquoteKeepsItsLineBreak(t *testing.T) {
+	got := renderOne(t, "> # Quoted heading\n>\n> Body.")
+	want := "<blockquote><b>Quoted heading</b>\n\nBody.</blockquote>"
+	if got != want {
+		t.Errorf("Render() = %q, want %q", got, want)
+	}
+	assertTagBalanced(t, got)
+}
+
+// TestRender_HeadingInsideListItemDoesNotOpenABlankLine covers the other joiner
+// a heading can sit against: list items are separated by a single newline, and
+// the heading already supplied it.
+func TestRender_HeadingInsideListItemDoesNotOpenABlankLine(t *testing.T) {
+	got := renderOne(t, "- # Item heading\n- plain item")
+	want := "- <b>Item heading</b>\n- plain item"
+	if got != want {
+		t.Errorf("Render() = %q, want %q", got, want)
+	}
+	assertTagBalanced(t, got)
 }
 
 // TestRender_FencedCodeBlockCarriesWrappers covers the Block shape the chunker
@@ -346,6 +513,67 @@ func TestRender_FencedCodeBlockCarriesWrappers(t *testing.T) {
 	if got := b.HTML(); got != want {
 		t.Errorf("HTML() = %q, want %q", got, want)
 	}
+}
+
+// TestRender_FencedCodeCarriesItsLanguage covers R13. Telegram documents the
+// language annotation as a class on a <code> nested inside <pre>, in that order,
+// and names the "language-xxx" form; anything else loses the annotation.
+//
+// An unannotated fence still emits pre+code rather than a bare pre, so every
+// code block has the same shape — which is what lets the chunker reopen one
+// wrapper set when it splits an oversized block.
+func TestRender_FencedCodeCarriesItsLanguage(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{
+			"annotated fence",
+			"```go\nx := 1\n```",
+			"<pre><code class=\"language-go\">x := 1\n</code></pre>",
+		},
+		{
+			"unannotated fence",
+			"```\nx := 1\n```",
+			"<pre><code>x := 1\n</code></pre>",
+		},
+		{
+			"language with punctuation",
+			"```objective-c\nid x;\n```",
+			"<pre><code class=\"language-objective-c\">id x;\n</code></pre>",
+		},
+		{
+			"info string beyond the language is dropped",
+			"```go title=main.go\nx := 1\n```",
+			"<pre><code class=\"language-go\">x := 1\n</code></pre>",
+		},
+		{
+			"indented code has no language to carry",
+			"    x := 1",
+			"<pre><code>x := 1\n</code></pre>",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := renderOne(t, tc.src)
+			if got != tc.want {
+				t.Errorf("Render(%q) = %q, want %q", tc.src, got, tc.want)
+			}
+			assertTagBalanced(t, got)
+		})
+	}
+}
+
+// TestRender_FencedCodeLanguageIsEscapedIntoTheClass keeps the language
+// annotation from becoming an injection point: it comes from the source, lands
+// inside a quoted attribute, and must not be able to close it.
+func TestRender_FencedCodeLanguageIsEscapedIntoTheClass(t *testing.T) {
+	got := renderOne(t, "```a\"><b\nbody\n```")
+	if strings.Contains(got, `"><b`) {
+		t.Errorf("Render() = %q — the language annotation escaped its attribute", got)
+	}
+	assertTagBalanced(t, got)
 }
 
 // TestRender_CodeBlockContentIsEscaped guards against code fences becoming an
@@ -686,6 +914,47 @@ func TestRender_KitchenSink(t *testing.T) {
 	got := Join(blocks)
 	if got != KitchenSinkHTML {
 		t.Errorf("Render() mismatch\n got: %q\nwant: %q", got, KitchenSinkHTML)
+	}
+	for i, b := range blocks {
+		assertTagBalanced(t, b.HTML())
+		if b.Len() == 0 {
+			t.Errorf("block %d is empty", i)
+		}
+	}
+}
+
+// TypographySource is this phase's end-to-end document: a heading, a
+// language-annotated fenced code block, a strikethrough span, an ordinary link
+// and a javascript: link, together. Each construct has its own case above; this
+// exists because they can each be right in isolation and interfere in sequence.
+// Exported for the adapter tests, which send the same document through the send
+// path.
+const TypographySource = "## Results\n\n" +
+	"The ~~old~~ new approach works. See [the docs](https://example.com/a_b) " +
+	"and do not follow [this one](javascript:alert(1)).\n\n" +
+	"```go\nif a < b { return \"ok\" }\n```\n"
+
+// TypographyHTML is the expected rendering of TypographySource.
+const TypographyHTML = "<b>Results</b>\n" +
+	"\n" +
+	"The <s>old</s> new approach works. See <a href=\"https://example.com/a_b\">the docs</a> " +
+	"and do not follow this one." +
+	"\n\n" +
+	"<pre><code class=\"language-go\">if a &lt; b { return \"ok\" }\n</code></pre>"
+
+// TestRender_TypographyDocument covers R10, R13, R14 and R16 in one document.
+func TestRender_TypographyDocument(t *testing.T) {
+	blocks, err := Render([]byte(TypographySource))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	got := Join(blocks)
+	if got != TypographyHTML {
+		t.Errorf("Render() mismatch\n got: %q\nwant: %q", got, TypographyHTML)
+	}
+	if strings.Contains(got, "alert(1)") {
+		t.Errorf("Render() = %q — the rejected destination reached the output", got)
 	}
 	for i, b := range blocks {
 		assertTagBalanced(t, b.HTML())

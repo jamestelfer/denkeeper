@@ -397,6 +397,57 @@ func TestSend_KitchenSinkDocumentTriggersNoFallback(t *testing.T) {
 	}
 }
 
+// typographyMarkdown is the inline-and-block typography document: a heading, a
+// strikethrough span, an ordinary link, a rejected javascript: link, and a
+// language-annotated fenced code block. The renderer's golden test pins the
+// exact bytes; this asserts the document survives the send path and triggers no
+// fallback.
+const typographyMarkdown = "## Results\n\n" +
+	"The ~~old~~ new approach works. See [the docs](https://example.com/a_b) " +
+	"and do not follow [this one](javascript:alert(1)).\n\n" +
+	"```go\nif a < b { return \"ok\" }\n```\n"
+
+func TestSend_TypographyDocumentTriggersNoFallback(t *testing.T) {
+	bot := newFakeBot()
+	a := newWithSender(bot, nil, testLogger(), nil)
+
+	if err := a.Send(context.Background(), adapter.OutgoingMessage{
+		ExternalID: "12345",
+		Text:       typographyMarkdown,
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if got := bot.sendCount(); got != 1 {
+		t.Fatalf("send count = %d, want 1 — no fallback may trigger", got)
+	}
+	msg := bot.lastMessage(t)
+	if msg.ParseMode != "HTML" {
+		t.Fatalf("ParseMode = %q, want HTML", msg.ParseMode)
+	}
+
+	for _, want := range []string{
+		"<b>Results</b>\n", // heading, bold, own line
+		"<s>old</s>",       // strikethrough
+		`<a href="https://example.com/a_b">the docs</a>`, // allowlisted scheme, underscore intact
+		"<pre><code class=\"language-go\">",              // fenced code with its language
+		"if a &lt; b { return \"ok\" }",                  // fence content escaped, quote left literal
+	} {
+		if !strings.Contains(msg.Text, want) {
+			t.Errorf("outbound text is missing %q\ngot: %q", want, msg.Text)
+		}
+	}
+	// The rejected destination must not reach Telegram in any form: it autolinks
+	// visible text after parsing, so a destination left in the text could come
+	// back as a live link.
+	if strings.Contains(msg.Text, "alert(1)") {
+		t.Errorf("outbound text %q carries the rejected destination", msg.Text)
+	}
+	if !strings.Contains(msg.Text, "do not follow this one.") {
+		t.Errorf("outbound text %q lost the rejected link's label", msg.Text)
+	}
+}
+
 // recordingTTS captures the text handed to speech synthesis.
 type recordingTTS struct {
 	text string

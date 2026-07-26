@@ -7,7 +7,7 @@
 - [x] Phase 0: Bot seam and characterization baseline
 - [x] Phase 1: Vendored renderer and the HTML send path
 - [x] Phase 2: Fix the vendored-in defects
-- [ ] Phase 3: Inline and block typography
+- [x] Phase 3: Inline and block typography
 - [ ] Phase 4: Degrade tables and images
 - [ ] Phase 5: Chunker and multi-message send
 - [ ] Phase 6: Oversized block splitting
@@ -160,6 +160,47 @@ no status updates, no restatement of the plan.
   correct the malformed `<hr* * *` to satisfy its own tag-balance and tag-allowlist
   requirements. This phase owned only the choice of separator string.
 
+- **Phase 3 — the heading carries its own newline, and the joiner deducts it.**
+  R14 names the line break as part of the heading, so `<b>…</b>\n` is what the
+  heading emits — otherwise the requirement holds only where the surrounding
+  joiner happens to be one. Writing `BlockSeparator` on top of that newline
+  opened two blank lines between a heading and its first sentence, so
+  `separatorAfter(prev, sep)` deducts the newlines `prev` already contributed.
+  It is applied at all four join sites (`Join`, `writeChildBlocks`, `writeList`,
+  `writeListItem`) so a heading behaves the same wherever it appears.
+- **Phase 3 — `extension.Strikethrough` is selected on its own, and the parser
+  is a package-level `mdParser` rather than `goldmark.DefaultParser()`.** Phase
+  4 needs `Table` in the same place, and the locked decision forbids
+  `extension.GFM`, which would bundle linkify and wrap the originating defect's
+  bare URLs in anchors.
+- **Phase 3 — GFM matches one *or* two tildes, so `~b~` is strikethrough too.**
+  The first test asserted a single tilde stayed literal and was wrong against
+  the spec. The real risk enabling the extension introduces is prose pairing —
+  `cd ~/foo and ~/bar`, `approx ~5 to ~10` — which GFM's flanking rules already
+  prevent. Probed and pinned as cases rather than assumed.
+- **Phase 3 — R13's and R16's tests were already passing on arrival.** Phase 1
+  had to build the `pre`/`code` language class to give the chunker a wrapper
+  pair, and had to replace upstream's bypassable denylist rather than ship it.
+  This phase owned the hostile-input coverage: case variation, padding, embedded
+  tabs and control bytes, scheme-relative and relative destinations.
+- **Phase 3 — a destination CommonMark refuses to parse as a link is not a
+  renderer failure.** `[click](<java\nscript:alert(1)>)` is not a link at all —
+  a bracketed destination may not contain a newline — so the whole source
+  survives as prose. The table marks that case `notALink`: the anchor and `href`
+  assertions still apply, the destination-absent assertion does not, because the
+  renderer emits any other `javascript:` string in prose verbatim too.
+- **Phase 3 — a rejected *autolink* keeps its label, which is its destination.**
+  For `[label](dest)` the destination is dropped entirely; for
+  `<javascript:alert(1)>` the label is the destination and dropping it would
+  lose content silently. It is emitted as escaped text, which is exactly what
+  the same string gets as ordinary prose, and Telegram does not autolink a
+  `javascript:` scheme in visible text.
+- **Phase 3 — `just scan` is unchanged from the Phase 1 baseline.** The same
+  three `nolint`-annotated gosec findings (config writer, `audit/emitter.go`,
+  `cmd/denkeeper/main.go`) and the same `GO-2026-5970` in
+  `golang.org/x/text@v0.38.0`. No finding touches `url.go` or any other
+  URL-handling code, which is what this phase's gate asks.
+
 ### Deferred to system testing
 
 - **Phase 1 — whether Telegram renders a literal `"` and a `%22` in `href`
@@ -175,3 +216,10 @@ no status updates, no restatement of the plan.
   pinned; whether the glyphs abut into a continuous line depends on the client font.
 - **Phase 2 — whether a flattened nested quotation is confusing to a reader.** The
   text of both levels survives, but the level distinction is gone by construction.
+- **Phase 3 — whether Telegram accepts and monospaces `language-xxx` on a
+  nested `code`.** The structure and the class bytes are pinned; whether the
+  fence renders monospaced and syntax-tagged on a given client is not assertable
+  here.
+- **Phase 3 — whether one blank line after a bold heading reads as a heading.**
+  The bytes are pinned at exactly one; whether that is enough visual separation
+  at a phone's line height is an appearance question.
