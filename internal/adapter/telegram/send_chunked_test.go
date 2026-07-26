@@ -572,3 +572,51 @@ func TestSend_BlankReplySendsNothing(t *testing.T) {
 		t.Errorf("send count = %d, want 0 — a blank reply is not a message", got)
 	}
 }
+
+// TestSend_TooManyChunksIsTruncatedToABoundedNumberOfMessages closes the
+// unbounded-send path. sendChunks issues one API call per chunk with nothing
+// limiting how many there are, so a reply that splits absurdly becomes a burst
+// of sequential sendMessage calls. Telegram rate-limits per chat, so the burst
+// is answered with a 429 partway through — and by then chunks have been
+// delivered, which disables the plain-text retry. The reader is left with a
+// truncated reply either way; the difference is whether the bot spent its rate
+// limit getting there.
+//
+// Falling back to plain text is not the remedy: a reply that splits this far is
+// far past the 4096-character cap, so the single plain message would be rejected
+// and the whole reply lost. Truncating delivers the bulk of it, says so, and
+// bounds the cost.
+func TestSend_TooManyChunksIsTruncatedToABoundedNumberOfMessages(t *testing.T) {
+	bot := newFakeBot()
+	a := newWithSender(bot, nil, testLogger(), nil)
+
+	src := longReply(400)
+	chunks, err := renderChunks(src)
+	if err != nil {
+		t.Fatalf("renderChunks: %v", err)
+	}
+	if len(chunks) <= maxOutboundChunks {
+		t.Fatalf("fixture renders to %d chunks, want more than %d", len(chunks), maxOutboundChunks)
+	}
+
+	if err := a.Send(context.Background(), adapter.OutgoingMessage{
+		ExternalID: "12345",
+		Text:       src,
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	msgs := bot.messages(t)
+	if len(msgs) != maxOutboundChunks {
+		t.Fatalf("send count = %d, want %d — the number of messages is bounded", len(msgs), maxOutboundChunks)
+	}
+	last := msgs[len(msgs)-1].Text
+	if !strings.Contains(last, truncationNotice) {
+		t.Errorf("last message does not say the reply was cut short: %q", last)
+	}
+	for i, m := range msgs {
+		if n := utf8.RuneCountInString(m.Text); n > telegramMessageCap {
+			t.Errorf("message %d is %d characters, over Telegram's cap of %d", i, n, telegramMessageCap)
+		}
+	}
+}

@@ -372,6 +372,21 @@ const MessageChunkLimit = 3500
 // going out as one message at all.
 const telegramMessageCap = 4096
 
+// maxOutboundChunks bounds how many messages one reply may become.
+//
+// sendChunks issues one API call per chunk, and Telegram rate-limits per chat
+// at roughly twenty messages a minute. Ten keeps any single reply comfortably
+// inside that, and ten chunks is already 35 KB of rendered HTML — far more than
+// a reply that is merely long. Exceeding it means the chunker is producing
+// chunks that carry very little text each, which heavily-tagged content can do
+// because chunk length is counted in raw HTML bytes.
+const maxOutboundChunks = 10
+
+// truncationNotice is appended to the last message of a reply that was cut
+// short. Plain text: it rides on a chunk sent with HTML parse mode, so it must
+// carry nothing that needs escaping.
+const truncationNotice = "[reply truncated: too long to send]"
+
 // sendText renders msg's text and delivers it, returning the message ID of the
 // last message sent. It is the shared body of Send and SendAndGetID, so the two
 // cannot drift in how they render, chunk, fall back or abort.
@@ -418,6 +433,8 @@ func (a *Adapter) sendText(chatID int64, msg adapter.OutgoingMessage) (int, erro
 		return a.sendPlain(base, markup)
 	}
 
+	chunks = a.capChunks(chunks)
+
 	id, delivered, err := a.sendChunks(base, markup, chunks)
 	if err == nil {
 		return id, nil
@@ -447,6 +464,26 @@ func (a *Adapter) sendText(chatID int64, msg adapter.OutgoingMessage) (int, erro
 	// markdown once with no parse mode — never a half-rendered string.
 	a.logger.Debug("html send failed, retrying as plain text", "error", err)
 	return a.sendPlain(base, markup)
+}
+
+// capChunks bounds a reply to maxOutboundChunks messages, marking the last one
+// so the truncation is visible to the reader rather than silent.
+//
+// The notice is appended rather than sent as an extra message: an extra message
+// is one more call against the rate limit this cap exists to protect, and a
+// chunk has headroom for it — the chunker splits at MessageChunkLimit, well
+// under Telegram's own cap.
+func (a *Adapter) capChunks(chunks []string) []string {
+	if len(chunks) <= maxOutboundChunks {
+		return chunks
+	}
+	a.logger.Warn("reply truncated: too many chunks to send",
+		"chunks", len(chunks), "limit", maxOutboundChunks)
+
+	capped := chunks[:maxOutboundChunks]
+	last := len(capped) - 1
+	capped[last] += "\n\n" + truncationNotice
+	return capped
 }
 
 // sendChunks sends one Telegram message per chunk, in source order, and returns
