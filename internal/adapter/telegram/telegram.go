@@ -342,66 +342,129 @@ func (a *Adapter) Send(ctx context.Context, msg adapter.OutgoingMessage) error {
 	}
 
 	// Text reply (default path).
-	tgMsg := tgbotapi.NewMessage(chatID, msg.Text)
-	tgMsg.DisableNotification = msg.Silent
-
-	// Attach inline keyboard buttons if provided.
-	if len(msg.Buttons) > 0 {
-		rows := buildButtonRows(msg.Buttons, msg.ButtonLayout)
-		tgMsg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+	if _, err = a.sendText(chatID, msg); err != nil {
+		return err
 	}
-
-	// An explicit parse mode is the caller's own markup — the activity log
-	// builds pre-escaped HTML — so it is forwarded unrendered and unretried.
-	if msg.ParseMode != "" {
-		tgMsg.ParseMode = msg.ParseMode
-		if _, err = a.sender.Send(tgMsg); err != nil {
-			return fmt.Errorf("sending telegram message: %w", err)
-		}
-		return nil
-	}
-
-	// Default path: the text is CommonMark. Render it to Telegram's HTML subset
-	// locally rather than asking Telegram's legacy Markdown parser to do it.
-	rendered, renderErr := renderOutgoing(msg.Text)
-	if renderErr != nil {
-		a.logger.Debug("render failed, sending as plain text", "error", renderErr)
-		tgMsg.ParseMode = ""
-		if _, err = a.sender.Send(tgMsg); err != nil {
-			return fmt.Errorf("sending telegram message: %w", err)
-		}
-		return nil
-	}
-
-	tgMsg.Text = rendered
-	tgMsg.ParseMode = parseModeHTML
-	if _, err = a.sender.Send(tgMsg); err != nil {
-		// Telegram rejected the HTML. Retry the original markdown once with no
-		// parse mode — never a half-rendered string.
-		a.logger.Debug("html send failed, retrying as plain text", "error", err)
-		tgMsg.Text = msg.Text
-		tgMsg.ParseMode = ""
-		if _, err = a.sender.Send(tgMsg); err != nil {
-			return fmt.Errorf("sending telegram message: %w", err)
-		}
-	}
-
 	return nil
 }
 
 // parseModeHTML is Telegram's HTML parse mode identifier.
 const parseModeHTML = "HTML"
 
-// renderOutgoing renders outgoing markdown to a single Telegram-HTML string.
+// messageChunkLimit is the largest chunk the adapter will send, in bytes of
+// rendered HTML.
 //
-// Chunking a reply that exceeds Telegram's message cap is a later change; for
-// now every block goes out in one message.
-func renderOutgoing(text string) (string, error) {
+// Telegram's own cap is 4096 characters of the entity-stripped text, counted in
+// UTF-16 code units. Counting raw HTML bytes over-counts against that, which is
+// conservative and costs only the occasional extra message. The value matches
+// activityChunkMaxBytes in internal/agent/dispatcher.go so the two chunked paths
+// behave alike.
+const messageChunkLimit = 3500
+
+// sendText renders msg's text and delivers it, returning the message ID of the
+// last message sent. It is the shared body of Send and SendAndGetID, so the two
+// cannot drift in how they render, chunk, fall back or abort.
+//
+// An ID of zero with no error means the text rendered to nothing and no message
+// was sent.
+func (a *Adapter) sendText(chatID int64, msg adapter.OutgoingMessage) (int, error) {
+	base := tgbotapi.NewMessage(chatID, msg.Text)
+	base.DisableNotification = msg.Silent
+
+	var markup interface{}
+	if len(msg.Buttons) > 0 {
+		rows := buildButtonRows(msg.Buttons, msg.ButtonLayout)
+		markup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+	}
+
+	// An explicit parse mode is the caller's own markup — the activity log
+	// builds pre-escaped HTML and chunks it itself — so it is forwarded
+	// unrendered, unchunked and unretried.
+	if msg.ParseMode != "" {
+		base.ParseMode = msg.ParseMode
+		base.ReplyMarkup = markup
+		return a.sendOne(base)
+	}
+
+	// Default path: the text is CommonMark. Render it to Telegram's HTML subset
+	// locally rather than asking Telegram's legacy Markdown parser to do it.
+	chunks, renderErr := renderChunks(msg.Text)
+	if renderErr != nil {
+		a.logger.Debug("render failed, sending as plain text", "error", renderErr)
+		return a.sendPlain(base, msg.Text, markup)
+	}
+	if len(chunks) == 0 {
+		return 0, nil
+	}
+
+	id, err := a.sendChunks(base, markup, chunks)
+	if err == nil {
+		return id, nil
+	}
+	if len(chunks) > 1 {
+		// R31: a chunk failed, so the rest are abandoned. The plain-text retry
+		// replaces the whole message, which would re-deliver the chunks that
+		// already arrived, so it does not apply beyond a single-message reply.
+		return 0, err
+	}
+
+	// Telegram rejected the HTML. Retry the original markdown once with no parse
+	// mode — never a half-rendered string.
+	a.logger.Debug("html send failed, retrying as plain text", "error", err)
+	return a.sendPlain(base, msg.Text, markup)
+}
+
+// sendChunks sends one Telegram message per chunk, in source order, and returns
+// the final chunk's message ID. The inline keyboard rides on the final chunk
+// only: buttons under a mid-message fragment read as a broken message.
+func (a *Adapter) sendChunks(base tgbotapi.MessageConfig, markup interface{}, chunks []string) (int, error) {
+	var lastID int
+	for i, chunk := range chunks {
+		out := base
+		out.Text = chunk
+		out.ParseMode = parseModeHTML
+		out.ReplyMarkup = nil
+		if i == len(chunks)-1 {
+			out.ReplyMarkup = markup
+		}
+		sent, err := a.sender.Send(out)
+		if err != nil {
+			return 0, fmt.Errorf("sending telegram message chunk %d of %d: %w", i+1, len(chunks), err)
+		}
+		lastID = sent.MessageID
+	}
+	return lastID, nil
+}
+
+// sendPlain sends text with no parse mode — the fallback both R29 and R30 land
+// on. It always carries the original markdown, never a half-rendered string.
+func (a *Adapter) sendPlain(base tgbotapi.MessageConfig, text string, markup interface{}) (int, error) {
+	base.Text = text
+	base.ParseMode = ""
+	base.ReplyMarkup = markup
+	return a.sendOne(base)
+}
+
+func (a *Adapter) sendOne(out tgbotapi.MessageConfig) (int, error) {
+	sent, err := a.sender.Send(out)
+	if err != nil {
+		return 0, fmt.Errorf("sending telegram message: %w", err)
+	}
+	return sent.MessageID, nil
+}
+
+// renderChunks renders outgoing markdown to Telegram-HTML chunks, each within
+// the message limit and each independently tag-balanced.
+func renderChunks(text string) ([]string, error) {
 	blocks, err := tghtml.Render([]byte(text))
 	if err != nil {
-		return "", fmt.Errorf("rendering markdown to telegram html: %w", err)
+		return nil, fmt.Errorf("rendering markdown to telegram html: %w", err)
 	}
-	return tghtml.Join(blocks), nil
+	chunks, err := tghtml.Chunk(blocks, messageChunkLimit)
+	if err != nil {
+		return nil, fmt.Errorf("chunking telegram html: %w", err)
+	}
+	return chunks, nil
 }
 
 // handleCallbackQuery processes an inline keyboard button click. It answers
@@ -593,50 +656,17 @@ func (a *Adapter) SendAndGetID(ctx context.Context, msg adapter.OutgoingMessage)
 		return "", fmt.Errorf("parsing chat ID: %w", err)
 	}
 
-	tgMsg := tgbotapi.NewMessage(chatID, msg.Text)
-	tgMsg.DisableNotification = msg.Silent
-
-	if len(msg.Buttons) > 0 {
-		rows := buildButtonRows(msg.Buttons, msg.ButtonLayout)
-		tgMsg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
-	}
-
-	// An explicit parse mode is the caller's own markup: forwarded unrendered
-	// and unretried, exactly as on the Send path.
-	if msg.ParseMode != "" {
-		tgMsg.ParseMode = msg.ParseMode
-		sent, err := a.sender.Send(tgMsg)
-		if err != nil {
-			return "", fmt.Errorf("sending telegram message: %w", err)
-		}
-		return strconv.Itoa(sent.MessageID), nil
-	}
-
-	rendered, renderErr := renderOutgoing(msg.Text)
-	if renderErr != nil {
-		a.logger.Debug("render failed, sending as plain text", "error", renderErr)
-		tgMsg.ParseMode = ""
-		sent, err := a.sender.Send(tgMsg)
-		if err != nil {
-			return "", fmt.Errorf("sending telegram message: %w", err)
-		}
-		return strconv.Itoa(sent.MessageID), nil
-	}
-
-	tgMsg.Text = rendered
-	tgMsg.ParseMode = parseModeHTML
-	sent, err := a.sender.Send(tgMsg)
+	// Shared with Send: same rendering, chunking, fallback and abort behaviour.
+	// A multi-chunk reply returns the final chunk's ID, because callers edit the
+	// message they were handed and an edit must land on the tail of the reply.
+	id, err := a.sendText(chatID, msg)
 	if err != nil {
-		// Telegram rejected the HTML: retry the original markdown once, plain.
-		a.logger.Debug("html send failed, retrying as plain text", "error", err)
-		tgMsg.Text = msg.Text
-		tgMsg.ParseMode = ""
-		sent, err = a.sender.Send(tgMsg)
+		return "", err
 	}
-	if err != nil {
-		return "", fmt.Errorf("sending telegram message: %w", err)
+	if id == 0 {
+		return "", fmt.Errorf("telegram message %q rendered to no content", msg.ExternalID)
 	}
-	return strconv.Itoa(sent.MessageID), nil
+	return strconv.Itoa(id), nil
 }
 
 // EditText edits an existing Telegram message. Implements adapter.MessageEditor.

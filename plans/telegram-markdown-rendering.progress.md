@@ -9,7 +9,7 @@
 - [x] Phase 2: Fix the vendored-in defects
 - [x] Phase 3: Inline and block typography
 - [x] Phase 4: Degrade tables and images
-- [ ] Phase 5: Chunker and multi-message send
+- [x] Phase 5: Chunker and multi-message send
 - [ ] Phase 6: Oversized block splitting
 - [ ] Phase 7: Fallback counter and warning log
 
@@ -249,6 +249,42 @@ no status updates, no restatement of the plan.
   test is unchanged, which is what confirms linkify did not arrive with the
   extension.
 
+- **Phase 5 — `Send` and `SendAndGetID` share one `sendText` helper, and both
+  shrank to a parse plus a call.** They independently reimplemented the whole
+  render-fallback-retry sequence, which is how a chunking change could easily
+  have landed on one path and not the other. `SendAndGetID` is now `sendText`
+  plus the ID formatting, so the two cannot drift.
+- **Phase 5 — R30's plain-text retry applies only to a single-chunk reply; R31
+  governs beyond that.** The retry replaces the *whole* message, so on a
+  multi-chunk send it would re-deliver the chunks that already arrived. That is
+  how the plan's two acceptance criteria reconcile: "exactly one retry" for one
+  message, "exactly 2 send attempts of 4" for a chunked one.
+- **Phase 5 — an oversized block is emitted whole and over-limit, not
+  truncated.** Documented on `Chunk`, pinned by a test, and paired with a
+  termination guard that sweeps limits from 1 upward — a packing loop that
+  cannot place a block is the classic place to spin forever.
+- **Phase 5 — R18 and R23 are asserted as one swept property rather than as
+  cases.** Rejoining the chunks with `BlockSeparator` must reproduce `Join`
+  exactly, checked at every limit from the widest block up. That single equality
+  is simultaneously no-reordering, no-loss, no-duplication and no-mid-rune-split,
+  and the content is multi-byte throughout so the last of those has teeth. A
+  per-case assertion passes on whichever limit it happens to pick.
+- **Phase 5 — a rate limit is not special-cased.** Telegram documents roughly
+  one message per second per chat with bursts tolerated, and a chunked reply is
+  a handful of messages, so a 429 mid-sequence is unlikely. When it happens R31
+  applies unchanged: abort. A bounded backoff would leave a reply half-delivered
+  and resume after an arbitrary pause, which reads worse than a visible failure.
+  Covered by injecting a `tgbotapi.Error{Code: 429}` at chunk 3 of 4.
+- **Phase 5 — a reply that renders to no blocks sends nothing, and
+  `SendAndGetID` calls that an error.** Telegram rejects an empty message, and a
+  caller that asked for an identifier would otherwise use `""` to edit a message
+  that does not exist.
+- **Phase 5 — the chunk count on a realistic long reply is sane, so the
+  over-counting worry did not bite.** 60 formatted lines (~5.4 KB of HTML)
+  produce 2 chunks and 120 produce 4, against a 3500-byte limit. Counting raw
+  HTML bytes over-counts against Telegram's entity-stripped UTF-16 measure, but
+  not by enough to matter.
+
 ### Deferred to system testing
 
 - **Phase 1 — whether Telegram renders a literal `"` and a `%22` in `href`
@@ -280,3 +316,9 @@ no status updates, no restatement of the plan.
 - **Phase 4 — whether Telegram renders a degraded image anchor usefully.** The
   anchor and its label are pinned; whether tapping it opens the image or a
   browser depends on the client.
+- **Phase 5 — whether several messages arriving back to back read as one
+  reply.** Order, completeness and per-chunk size are asserted from the captured
+  sends; how a split reply feels in a real chat thread is not assertable here.
+- **Phase 5 — whether real traffic ever trips Telegram's per-chat flow limit.**
+  The abort behaviour on a 429 is pinned by an injected error; how often a
+  chunked reply actually provokes one is a question for a live instance.
