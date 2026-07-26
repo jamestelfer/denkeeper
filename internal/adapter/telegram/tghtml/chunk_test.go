@@ -415,3 +415,39 @@ func TestChunk_NestedTagUsesTheWholeBudget(t *testing.T) {
 	}
 	assertChunksValid(t, chunks, len(joined))
 }
+
+// TestChunk_EveryChunkCarriesText is the precondition R19's balance check does
+// not cover: a chunk becomes a Telegram message, and Telegram rejects one whose
+// text is empty however well-formed its markup is.
+//
+// An element whose opening tag alone overruns the limit is the case that
+// produces one — the tag is written because a fresh chunk has nowhere else to
+// put it, and if the chunk then wraps before any text arrives, what it emits is
+// a pair of tags around nothing. Reopened tags are already treated as not being
+// content; a tag opened for the first time is no more content than a reopened
+// one.
+func TestChunk_EveryChunkCarriesText(t *testing.T) {
+	// The anchor's opening tag is 28 bytes on its own, so no chunk can hold it
+	// and the label together within the limit.
+	blocks, err := Render([]byte("[a](https://e.com) [b](https://e.com)"))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	chunks, err := Chunk(blocks, 20)
+	if err != nil {
+		t.Fatalf("Chunk: %v", err)
+	}
+	if len(chunks) == 0 {
+		t.Fatal("no chunks — the content must survive")
+	}
+	for i, c := range chunks {
+		if strings.TrimSpace(stripTags(c)) == "" {
+			t.Errorf("chunk %d of %d carries no text: %q", i, len(chunks), c)
+		}
+		assertTagBalanced(t, c)
+	}
+	if got := stripTags(strings.Join(chunks, "")); !strings.Contains(got, "a") || !strings.Contains(got, "b") {
+		t.Errorf("chunk text = %q, want both labels", got)
+	}
+}

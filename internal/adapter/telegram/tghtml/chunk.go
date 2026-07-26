@@ -34,6 +34,7 @@ func Chunk(blocks []Block, limit int) ([]string, error) {
 		c.addBlock(b)
 	}
 	c.flush()
+	c.drainPending()
 	return c.chunks, nil
 }
 
@@ -45,7 +46,12 @@ type chunker struct {
 	cur   strings.Builder
 	open  []token // elements currently open, outermost first
 	tail  string  // trailing run of newlines in cur, for separator collapsing
-	empty bool    // true until cur holds something other than reopened tags
+	empty bool    // true until cur holds text that is not merely whitespace
+	// pending is whitespace held back because the chunk has no content yet. It
+	// is written out as soon as content arrives, and otherwise survives the
+	// flush to lead the next chunk — so a chunk is never nothing but spaces and
+	// no character is dropped on the way.
+	pending string
 }
 
 // addBlock appends one block, starting a new chunk in preference to splitting
@@ -77,7 +83,11 @@ func (c *chunker) addBlock(b Block) {
 // when it does not fit.
 func (c *chunker) add(t token) {
 	if !t.isText() {
-		if c.used()+admitCost(t) > c.limit && c.hasContent() {
+		// Only an opening tag can force a wrap. A closing tag is budget-neutral,
+		// and deferring one to the next chunk would strand its element open at the
+		// end of this chunk and reopen it in the next with nothing between the
+		// reopened tag and the close — an element wrapped around nothing.
+		if t.open && c.used()+admitCost(t) > c.limit && c.hasContent() {
 			c.wrap()
 		}
 		c.writeTag(t)
@@ -112,7 +122,7 @@ func (c *chunker) add(t token) {
 // used is the emitted length of the active chunk plus what it will cost to close
 // the elements currently open. A chunk is only ever completed by closing them,
 // so that cost is part of the budget from the moment they are opened.
-func (c *chunker) used() int { return c.cur.Len() + c.closeCost() }
+func (c *chunker) used() int { return c.cur.Len() + len(c.pending) + c.closeCost() }
 
 // closeCost is the cost of closing everything currently open.
 func (c *chunker) closeCost() int {
@@ -150,8 +160,17 @@ func (c *chunker) writeText(s string) {
 	if s == "" {
 		return
 	}
-	c.cur.WriteString(s)
-	c.empty = false
+	if c.empty && strings.TrimSpace(s) == "" {
+		// Leading whitespace of a chunk that has nothing in it yet. Held back
+		// rather than written: if the chunk never gains content, this is all it
+		// would carry, and Telegram rejects a message whose text is empty.
+		c.pending += s
+	} else {
+		c.cur.WriteString(c.pending)
+		c.pending = ""
+		c.cur.WriteString(s)
+		c.empty = false
+	}
 	if trimmed := strings.TrimRight(s, "\n"); trimmed == "" {
 		c.tail += s
 	} else {
@@ -162,7 +181,11 @@ func (c *chunker) writeText(s string) {
 func (c *chunker) writeTag(t token) {
 	c.cur.WriteString(t.emitted())
 	c.tail = ""
-	c.empty = false
+	// A tag is markup, not content — the same reasoning wrap() applies to the
+	// tags it reopens. An element whose opening tag alone overruns the limit is
+	// written anyway, because a fresh chunk has nowhere else to put it; if the
+	// chunk then wraps before any text arrives, treating the tag as content would
+	// emit a pair of tags around nothing.
 	if t.open {
 		c.open = append(c.open, t)
 		return
@@ -195,6 +218,20 @@ func (c *chunker) wrap() {
 	// empty, and wrapping again must not emit it.
 	c.empty = true
 	c.tail = ""
+}
+
+// drainPending appends whitespace still held back once there is no next chunk
+// for it to lead. Trailing whitespace of the whole reply is inert to Telegram,
+// which trims it, but inside a fenced block a final newline is content and
+// dropping it would silently shorten the code. With no chunk to append it to
+// there is nothing to preserve it in, and a chunk of nothing but whitespace is
+// exactly what must not be sent.
+func (c *chunker) drainPending() {
+	if c.pending == "" || len(c.chunks) == 0 {
+		return
+	}
+	c.chunks[len(c.chunks)-1] += c.pending
+	c.pending = ""
 }
 
 // flush emits the active chunk, closing everything still open.
