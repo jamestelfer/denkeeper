@@ -77,7 +77,7 @@ func (c *chunker) addBlock(b Block) {
 // when it does not fit.
 func (c *chunker) add(t token) {
 	if !t.isText() {
-		if c.used()+t.size()+c.closeCost(t) > c.limit && c.hasContent() {
+		if c.used()+admitCost(t) > c.limit && c.hasContent() {
 			c.wrap()
 		}
 		c.writeTag(t)
@@ -112,19 +112,33 @@ func (c *chunker) add(t token) {
 // used is the emitted length of the active chunk plus what it will cost to close
 // the elements currently open. A chunk is only ever completed by closing them,
 // so that cost is part of the budget from the moment they are opened.
-func (c *chunker) used() int { return c.cur.Len() + c.closeCost(token{}) }
+func (c *chunker) used() int { return c.cur.Len() + c.closeCost() }
 
-// closeCost is the cost of closing everything open, plus extra if it is an
-// opening tag about to be added.
-func (c *chunker) closeCost(extra token) int {
+// closeCost is the cost of closing everything currently open.
+func (c *chunker) closeCost() int {
 	n := 0
 	for _, t := range c.open {
 		n += t.closer().size()
 	}
-	if !extra.isText() && extra.open {
-		n += extra.closer().size()
-	}
 	return n
+}
+
+// admitCost is what admitting t adds to the budget used() reports.
+//
+// An opening tag costs its own bytes plus the closer it obliges. A closing tag
+// costs nothing: used() has reserved its bytes since the element was opened, and
+// writing it hands those same bytes back. The elements already open are likewise
+// carried by used(), so counting them again here would reserve their closers
+// twice and wrap a chunk that still has room.
+func admitCost(t token) int {
+	switch {
+	case t.isText():
+		return len(t.text)
+	case t.open:
+		return t.size() + t.closer().size()
+	default:
+		return 0
+	}
 }
 
 // hasContent reports whether the active chunk holds anything beyond the elements

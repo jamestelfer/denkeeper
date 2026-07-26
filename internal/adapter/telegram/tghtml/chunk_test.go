@@ -389,3 +389,29 @@ func TestChunk_RejectsANonPositiveLimit(t *testing.T) {
 		}
 	}
 }
+
+// TestChunk_NestedTagUsesTheWholeBudget extends R21's exact-fit boundary to a
+// tag opened while another element is already open. The budget is the emitted
+// length plus the cost of closing what is open; opening one more element adds
+// its own closer to that cost and nothing else. Counting the enclosing closers a
+// second time reserves room the chunk has already reserved, and the block breaks
+// apart on a limit it fits inside.
+func TestChunk_NestedTagUsesTheWholeBudget(t *testing.T) {
+	blocks, err := Render([]byte("> aaa **b**"))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	joined := Join(blocks)
+
+	chunks, err := Chunk(blocks, len(joined))
+	if err != nil {
+		t.Fatalf("Chunk: %v", err)
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("chunk count = %d, want 1 — the block fits exactly: %q", len(chunks), chunks)
+	}
+	if chunks[0] != joined {
+		t.Errorf("chunk = %q, want %q", chunks[0], joined)
+	}
+	assertChunksValid(t, chunks, len(joined))
+}
