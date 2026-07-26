@@ -39,7 +39,7 @@ import (
 // travel as plain text and Telegram autolinks them after parsing, which is the
 // behaviour the regression test pins.
 var mdParser = goldmark.New(
-	goldmark.WithExtensions(extension.Strikethrough),
+	goldmark.WithExtensions(extension.Strikethrough, extension.Table),
 ).Parser()
 
 // Wrapper is an element that encloses a block's content. A block's wrappers are
@@ -158,6 +158,9 @@ func renderBlockNode(src []byte, node ast.Node) (Block, bool, error) {
 		return codeBlock(src, n, n.Language(src)), true, nil
 	case *ast.CodeBlock:
 		return codeBlock(src, n, nil), true, nil
+	case *east.Table:
+		block := renderTable(src, n)
+		return block, block.Content != "", nil
 	case *ast.Blockquote:
 		var sb strings.Builder
 		if err := writeChildBlocks(&sb, src, n, BlockSeparator); err != nil {
@@ -241,6 +244,13 @@ func writeBlockContent(sb *strings.Builder, src []byte, node ast.Node) error {
 
 	case *ast.CodeBlock:
 		sb.WriteString(codeBlock(src, n, nil).HTML())
+		return nil
+
+	case *east.Table:
+		// Nested inside another block, so the pre goes into the enclosing
+		// block's content rather than becoming a wrapper of its own — the same
+		// treatment a nested code block gets.
+		sb.WriteString(renderTable(src, n).HTML())
 		return nil
 
 	case *ast.Blockquote:
@@ -430,7 +440,7 @@ func renderInline(sb *strings.Builder, src []byte, node ast.Node) error {
 	case *ast.AutoLink:
 		return renderAutoLink(sb, src, n)
 	case *ast.Image:
-		return ErrImage
+		return renderImage(sb, src, n)
 	case *ast.RawHTML:
 		return ErrRawHTML
 	}
@@ -456,6 +466,43 @@ func renderLink(sb *strings.Builder, src []byte, n *ast.Link) error {
 	if err := renderInlineChildren(sb, src, n); err != nil {
 		return err
 	}
+	sb.WriteString(`</a>`)
+	return nil
+}
+
+// renderImage degrades an image to an anchor labelled with its alternative
+// text. Telegram's HTML subset cannot embed an image in a text message, and
+// upstream failed closed on one — which for arbitrary LLM output would route
+// ordinary replies to the unstyled plain-text fallback.
+//
+// The destination goes through the same allowlist as a link: an image is a link
+// as far as Telegram is concerned once it is degraded, so R16 applies unchanged.
+func renderImage(sb *strings.Builder, src []byte, n *ast.Image) error {
+	var label strings.Builder
+	if err := renderInlineChildren(&label, src, n); err != nil {
+		return err
+	}
+
+	if !schemeAllowed(n.Destination) {
+		// Label only, destination dropped — R16. An image with neither an
+		// allowlisted destination nor alternative text carries nothing that can
+		// safely be shown: the destination is exactly what must not be emitted,
+		// and a placeholder would be text the author never wrote.
+		sb.WriteString(label.String())
+		return nil
+	}
+
+	text := label.String()
+	if text == "" {
+		// No alternative text to label the anchor with. The destination is
+		// allowlisted, so showing it is safe and is more useful than an empty
+		// anchor, which Telegram would render as nothing at all.
+		text = escapeText(n.Destination, true)
+	}
+	sb.WriteString(`<a href="`)
+	sb.WriteString(escapeAttr(n.Destination))
+	sb.WriteString(`">`)
+	sb.WriteString(text)
 	sb.WriteString(`</a>`)
 	return nil
 }

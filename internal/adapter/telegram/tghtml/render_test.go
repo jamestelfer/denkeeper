@@ -391,24 +391,289 @@ func TestRender_RawHTMLFailsClosed(t *testing.T) {
 	}
 }
 
-// TestRender_ImageErrorIsDistinguishableFromRawHTML covers the error split.
-// Upstream returns one shared errTagNotAllowed for raw HTML and images, so the
-// adapter cannot tell a must-fail-closed case from a should-degrade one, and
-// R15's obligation to name the construct is unmet. Degrading images is a later
-// phase, and it needs this split to exist first.
-func TestRender_ImageErrorIsDistinguishableFromRawHTML(t *testing.T) {
-	_, err := Render([]byte("![alt text](https://example.com/i.png)"))
-	if err == nil {
-		t.Fatal("Render of an image: want an error at this phase")
+// TestRender_ImageDegradesToAnAnchor covers R12. Telegram's HTML subset cannot
+// embed an image in a text message, and upstream failed closed on one — which
+// for arbitrary LLM output would route ordinary replies to the unstyled
+// plain-text fallback. An anchor labelled with the alternative text keeps both
+// the description and the destination reachable.
+//
+// This inverts the Phase 1 assertion at the same site: images used to return an
+// error distinguishable from the raw-HTML one, and that split is what let this
+// phase degrade images while raw HTML still fails closed.
+func TestRender_ImageDegradesToAnAnchor(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{
+			"alt text becomes the label",
+			"![alt text](https://example.com/i.png)",
+			`<a href="https://example.com/i.png">alt text</a>`,
+		},
+		{
+			"underscore in the destination survives",
+			"![diagram](https://example.com/a_b.png)",
+			`<a href="https://example.com/a_b.png">diagram</a>`,
+		},
+		{
+			"image inside prose",
+			"before ![alt](https://example.com/i.png) after",
+			`before <a href="https://example.com/i.png">alt</a> after`,
+		},
+		{
+			"markup in the alt text is escaped",
+			"![a < b](https://example.com/i.png)",
+			`<a href="https://example.com/i.png">a &lt; b</a>`,
+		},
 	}
-	if !errors.Is(err, ErrImage) {
-		t.Errorf("error = %v, want ErrImage", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			blocks, err := Render([]byte(tc.src))
+			if err != nil {
+				t.Fatalf("Render(%q) = %v, want no error — an image degrades, it does not fail closed", tc.src, err)
+			}
+			if len(blocks) != 1 {
+				t.Fatalf("block count = %d, want 1", len(blocks))
+			}
+			if got := blocks[0].HTML(); got != tc.want {
+				t.Errorf("Render(%q) = %q, want %q", tc.src, got, tc.want)
+			}
+			assertTagBalanced(t, blocks[0].HTML())
+		})
 	}
-	if errors.Is(err, ErrRawHTML) {
-		t.Error("the image error must not be indistinguishable from the raw-HTML error")
+}
+
+// TestRender_ImageWithRejectedSchemeDropsTheAnchor keeps R16 applying to the
+// degraded form. An image is a link once degraded, so a hostile destination has
+// exactly the same reach it would have through [label](dest).
+func TestRender_ImageWithRejectedSchemeDropsTheAnchor(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"javascript with alt", "![the alt](javascript:alert(1))", "the alt"},
+		{"case varied", "![the alt](JaVaScRiPt:alert(1))", "the alt"},
+		{"data uri", "![the alt](data:image/png;base64,AAAA)", "the alt"},
+		// Neither an allowlisted destination nor a label: the destination is the
+		// one thing that must not be emitted, and inventing a placeholder would
+		// put text in the message the author never wrote.
+		{"no alt text either", "![](javascript:alert(1))", ""},
 	}
-	if !strings.Contains(err.Error(), "image") {
-		t.Errorf("error = %q, must name the construct", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			blocks, err := Render([]byte(tc.src))
+			if err != nil {
+				t.Fatalf("Render(%q): %v", tc.src, err)
+			}
+			var got string
+			if len(blocks) == 1 {
+				got = blocks[0].HTML()
+			}
+			if got != tc.want {
+				t.Errorf("Render(%q) = %q, want %q", tc.src, got, tc.want)
+			}
+			if strings.Contains(got, "<a") || strings.Contains(got, "alert(1)") {
+				t.Errorf("Render(%q) = %q — no anchor and no destination may reach the output", tc.src, got)
+			}
+		})
+	}
+}
+
+// TestRender_ImageWithoutAltTextIsLabelledWithItsDestination records the
+// empty-alt choice for an allowlisted destination. An anchor with no label
+// renders as nothing at all in Telegram, which would drop the image silently.
+func TestRender_ImageWithoutAltTextIsLabelledWithItsDestination(t *testing.T) {
+	got := renderOne(t, "![](https://example.com/i_1.png)")
+	want := `<a href="https://example.com/i_1.png">https://example.com/i_1.png</a>`
+	if got != want {
+		t.Errorf("Render() = %q, want %q", got, want)
+	}
+	assertTagBalanced(t, got)
+}
+
+// threeColumnTable is a GFM table with cell widths that vary enough for a
+// column-width bug to be visible.
+const threeColumnTable = "| Name | Qty | Price |\n" +
+	"|------|-----|-------|\n" +
+	"| apple | 3 | 1.50 |\n" +
+	"| watermelon | 12 | 0.25 |\n"
+
+// TestRender_TableDegradesToAnAlignedPreBlock covers R11. Telegram's subset has
+// no table elements, and upstream failed closed on one — but LLM replies contain
+// tables routinely, so failing closed would send a large share of ordinary
+// messages unstyled. A preformatted block is the representable form, and pre is
+// what makes fixed-width columns line up.
+func TestRender_TableDegradesToAnAlignedPreBlock(t *testing.T) {
+	blocks, err := Render([]byte(threeColumnTable))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("block count = %d, want 1", len(blocks))
+	}
+	got := blocks[0].HTML()
+	want := "<pre>Name       | Qty | Price\n" +
+		"-----------+-----+------\n" +
+		"apple      | 3   | 1.50\n" +
+		"watermelon | 12  | 0.25</pre>"
+	if got != want {
+		t.Errorf("Render() =\n%q\nwant\n%q", got, want)
+	}
+	assertTagBalanced(t, got)
+}
+
+// TestRender_TableColumnsStartAtTheSameOffsetOnEveryRow verifies alignment
+// arithmetically rather than by eye, which is what catches the one-character
+// error a reader forgives. Offsets are computed from the output.
+func TestRender_TableColumnsStartAtTheSameOffsetOnEveryRow(t *testing.T) {
+	src := "| id | description | n |\n" +
+		"|----|-------------|---|\n" +
+		"| 1 | a very long description indeed | 42 |\n" +
+		"| 200 | short | 7 |\n" +
+		"| 33 | m | 1000000 |\n"
+
+	blocks, err := Render([]byte(src))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("block count = %d, want 1", len(blocks))
+	}
+
+	lines := strings.Split(blocks[0].Content, "\n")
+	if len(lines) != 5 {
+		t.Fatalf("line count = %d, want 5 (header, rule, three rows)", len(lines))
+	}
+
+	var want []int
+	for i, line := range lines {
+		offsets := columnOffsets(line)
+		if i == 0 {
+			want = offsets
+			continue
+		}
+		if len(offsets) != len(want) {
+			t.Fatalf("row %d %q has %d columns, want %d", i, line, len(offsets), len(want))
+		}
+		for c := range offsets {
+			if offsets[c] != want[c] {
+				t.Errorf("row %d %q: column %d starts at %d, want %d", i, line, c, offsets[c], want[c])
+			}
+		}
+	}
+}
+
+// columnOffsets returns the rune index at which each column of a rendered table
+// row begins. Column zero always begins at zero; every later column begins one
+// space after its preceding separator.
+func columnOffsets(line string) []int {
+	offsets := []int{0}
+	for i, r := range []rune(line) {
+		if r == '|' || r == '+' {
+			offsets = append(offsets, i+2)
+		}
+	}
+	return offsets
+}
+
+// TestRender_TableCellsAreEscapedAndCarryNoInlineMarkup records the cell-content
+// decision. A tag inside the block would add bytes that occupy no display width,
+// which is exactly what breaks fixed-width alignment — and Telegram does not
+// accept arbitrary nesting inside pre either. Cell text is the plain text of the
+// cell, escaped.
+func TestRender_TableCellsAreEscapedAndCarryNoInlineMarkup(t *testing.T) {
+	src := "| a | b |\n|---|---|\n| **bold** | x < y |\n"
+	got := renderOne(t, src)
+	if strings.Contains(got, "<b>") {
+		t.Errorf("Render() = %q — a cell must not carry inline markup", got)
+	}
+	if !strings.Contains(got, "x &lt; y") {
+		t.Errorf("Render() = %q, want the cell content escaped", got)
+	}
+	if !strings.Contains(got, "bold") {
+		t.Errorf("Render() = %q — the cell's text must survive", got)
+	}
+	assertTagBalanced(t, got)
+}
+
+// TestRender_TableNestedInsideAnotherBlock covers the path a table takes when it
+// is not a top-level node. Its pre lands in the enclosing block's content rather
+// than as a wrapper, the same way a nested code block does.
+func TestRender_TableNestedInsideAnotherBlock(t *testing.T) {
+	got := renderOne(t, "> | a | b |\n> |---|---|\n> | 1 | 2 |\n")
+	want := "<blockquote><pre>a | b\n--+--\n1 | 2</pre></blockquote>"
+	if got != want {
+		t.Errorf("Render() = %q, want %q", got, want)
+	}
+	assertTagBalanced(t, got)
+}
+
+// TestRender_TableWithoutABodyStillRenders guards the degenerate shape: GFM
+// requires a delimiter row, so a header with no data rows is a valid table.
+func TestRender_TableWithoutABodyStillRenders(t *testing.T) {
+	got := renderOne(t, "| a | b |\n|---|---|\n")
+	want := "<pre>a | b</pre>"
+	if got != want {
+		t.Errorf("Render() = %q, want %q", got, want)
+	}
+	assertTagBalanced(t, got)
+}
+
+// TestRender_TableRuleSpansTheWidestRow keeps the rule from stopping short when
+// a body cell in the final column is wider than its header.
+func TestRender_TableRuleSpansTheWidestRow(t *testing.T) {
+	got := renderOne(t, "| a | n |\n|---|---|\n| x | 1000000 |\n")
+	lines := strings.Split(strings.TrimSuffix(strings.TrimPrefix(got, "<pre>"), "</pre>"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("lines = %q, want three", lines)
+	}
+	widest := 0
+	for _, line := range lines {
+		if n := len([]rune(line)); n > widest {
+			widest = n
+		}
+	}
+	if got := len([]rune(lines[1])); got != widest {
+		t.Errorf("rule %q is %d wide, want %d — it must span the grid", lines[1], got, widest)
+	}
+}
+
+// TestRender_PipesInProseDoNotBecomeATable guards the parsing change enabling
+// the Table extension makes to every input, not just to tables.
+func TestRender_PipesInProseDoNotBecomeATable(t *testing.T) {
+	cases := []string{
+		"run a | b to pipe the output",
+		"the regex (foo|bar) matches either",
+		"| a lone leading pipe",
+	}
+	for _, src := range cases {
+		got := renderOne(t, src)
+		if strings.Contains(got, "<pre>") {
+			t.Errorf("Render(%q) = %q — prose must not become a table", src, got)
+		}
+		if got != src {
+			t.Errorf("Render(%q) = %q, want byte-identical input", src, got)
+		}
+	}
+}
+
+// TestRender_RawHTMLIsTheOnlyFailClosedConstruct pins the boundary this phase
+// draws. Upstream returned one shared error for raw HTML and images alike;
+// Phase 1 split it so that exactly this could happen.
+func TestRender_RawHTMLIsTheOnlyFailClosedConstruct(t *testing.T) {
+	degrades := []string{
+		"![alt](https://example.com/i.png)",
+		"| a | b |\n|---|---|\n| 1 | 2 |",
+	}
+	for _, src := range degrades {
+		if _, err := Render([]byte(src)); err != nil {
+			t.Errorf("Render(%q) = %v, want no error", src, err)
+		}
+	}
+	if _, err := Render([]byte("<div>x</div>")); !errors.Is(err, ErrRawHTML) {
+		t.Errorf("Render of raw HTML = %v, want ErrRawHTML — raw HTML still fails closed", err)
 	}
 }
 

@@ -20,14 +20,14 @@ func (e *UnsupportedError) Error() string {
 	return "tghtml: " + e.Construct + " is not supported by Telegram's HTML subset"
 }
 
-var (
-	// ErrRawHTML is returned when the source contains raw HTML, block or inline.
-	// This is the only construct that fails closed: it has no representable form
-	// and forwarding it would emit markup that never passed through this
-	// renderer's tag allowlist.
-	ErrRawHTML = &UnsupportedError{Construct: "raw HTML"}
-
-	// ErrImage is returned when the source contains an image. Telegram's HTML
-	// subset cannot embed an image in a text message.
-	ErrImage = &UnsupportedError{Construct: "image"}
-)
+// ErrRawHTML is returned when the source contains raw HTML, block or inline.
+// This is the only construct that fails closed: it has no representable form and
+// forwarding it would emit markup that never passed through this renderer's tag
+// allowlist.
+//
+// Images used to share telegold's single error with raw HTML, which is what made
+// the split necessary — a caller could not tell a must-fail-closed case from a
+// should-degrade one. Images now degrade to an anchor and tables to a
+// preformatted block, so raw HTML is the only value left. The named-construct
+// shape stays because it is what a future unsupported construct would reuse.
+var ErrRawHTML = &UnsupportedError{Construct: "raw HTML"}

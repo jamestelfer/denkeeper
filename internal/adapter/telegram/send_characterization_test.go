@@ -448,6 +448,46 @@ func TestSend_TypographyDocumentTriggersNoFallback(t *testing.T) {
 	}
 }
 
+// tableAndImageMarkdown is the pair of constructs upstream failed closed on.
+// This phase's whole value is that neither routes the message to the plain-text
+// fallback, so the send-count assertion below is the point of the test.
+const tableAndImageMarkdown = "Here are the results:\n\n" +
+	"| Name | Qty | Price |\n" +
+	"|------|-----|-------|\n" +
+	"| apple | 3 | 1.50 |\n" +
+	"| watermelon | 12 | 0.25 |\n\n" +
+	"![the chart](https://example.com/chart_1.png)\n"
+
+func TestSend_TableAndImageTriggerNoFallback(t *testing.T) {
+	bot := newFakeBot()
+	a := newWithSender(bot, nil, testLogger(), nil)
+
+	if err := a.Send(context.Background(), adapter.OutgoingMessage{
+		ExternalID: "12345",
+		Text:       tableAndImageMarkdown,
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if got := bot.sendCount(); got != 1 {
+		t.Fatalf("send count = %d, want 1 — no plain-text retry may happen", got)
+	}
+	msg := bot.lastMessage(t)
+	if msg.ParseMode != "HTML" {
+		t.Fatalf("ParseMode = %q, want HTML — an empty parse mode means the fallback fired", msg.ParseMode)
+	}
+
+	for _, want := range []string{
+		"<pre>Name       | Qty | Price\n",                         // aligned header
+		"apple      | 3   | 1.50\n",                               // aligned body row
+		`<a href="https://example.com/chart_1.png">the chart</a>`, // image degraded to an anchor
+	} {
+		if !strings.Contains(msg.Text, want) {
+			t.Errorf("outbound text is missing %q\ngot: %q", want, msg.Text)
+		}
+	}
+}
+
 // recordingTTS captures the text handed to speech synthesis.
 type recordingTTS struct {
 	text string

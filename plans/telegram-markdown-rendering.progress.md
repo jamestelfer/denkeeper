@@ -8,7 +8,7 @@
 - [x] Phase 1: Vendored renderer and the HTML send path
 - [x] Phase 2: Fix the vendored-in defects
 - [x] Phase 3: Inline and block typography
-- [ ] Phase 4: Degrade tables and images
+- [x] Phase 4: Degrade tables and images
 - [ ] Phase 5: Chunker and multi-message send
 - [ ] Phase 6: Oversized block splitting
 - [ ] Phase 7: Fallback counter and warning log
@@ -201,6 +201,54 @@ no status updates, no restatement of the plan.
   `golang.org/x/text@v0.38.0`. No finding touches `url.go` or any other
   URL-handling code, which is what this phase's gate asks.
 
+- **Phase 4 — the column arithmetic is `text/tabwriter`'s, not this package's.**
+  The first implementation hand-rolled width computation and padding. The
+  standard library already does it, it is the convention CLAUDE.md names for
+  tabular output, and it removed about sixty lines of arithmetic this package
+  would otherwise have had to keep correct. `tabwriter.Debug` draws the column
+  bar; a single leading space on every cell after the first turns its `a |b`
+  into `a | b`.
+- **Phase 4 — the header rule is derived from the formatted header line, not
+  from the column widths.** `strings.Map` turns each bar into `+` and everything
+  else into `-`, so the junctions cannot drift out of line with the bars above
+  and below — and the rule needs no access to tabwriter's internal widths. It is
+  then extended to the widest row, because tabwriter leaves the final column
+  unpadded and a body cell can run past the header.
+- **Phase 4 — a table cell renders as plain text, with no inline markup.** A
+  `<b>` inside the block would add bytes occupying no display width, which is
+  exactly what breaks fixed-width alignment; Telegram's subset does not accept
+  arbitrary nesting inside `pre` either. Tabs and newlines are replaced with
+  spaces before the cell reaches tabwriter, where they would otherwise open a
+  phantom column or end the row.
+- **Phase 4 — all columns are left-aligned; the source's `:---` markers are
+  ignored.** At chat width the distinction buys nothing and it keeps one
+  arithmetic rule for the whole grid.
+- **Phase 4 — CJK and emoji cells will not line up, and that is accepted.**
+  tabwriter counts runes, not display cells. Width-aware padding needs a
+  display-width table, which is a dependency this package does not otherwise
+  want.
+- **Phase 4 — wide tables are left to Phase 6 rather than truncated here.** The
+  table is a `pre`-wrapped block like a code block, so Phase 6's split logic
+  reaches it with no special case. Until then a wide table may exceed a chunk;
+  truncating would lose content, which is the failure class this work exists to
+  remove.
+- **Phase 4 — `ErrImage` is removed rather than left defined.** Nothing returns
+  it now that images degrade, and a dead exported error invites a caller to
+  check for a case that cannot happen. `UnsupportedError`'s named-construct
+  shape stays, because that is what a future unsupported construct reuses.
+- **Phase 4 — an image with a rejected scheme *and* no alt text emits nothing.**
+  The only two things available to show are the destination, which R16 forbids,
+  and an invented placeholder, which is text the author never wrote. With an
+  allowlisted destination and no alt text, the destination becomes the label —
+  an anchor with an empty label renders as nothing at all in Telegram, which
+  would drop the image silently.
+- **Phase 4 — enabling `extension.Table` was probed against ordinary prose.**
+  `run a | b`, `(foo|bar)` and a lone leading pipe all still render
+  byte-identical; GFM requires a delimiter row, so a stray pipe cannot form a
+  table. Pinned as cases rather than assumed, and the underscore-URL regression
+  test is unchanged, which is what confirms linkify did not arrive with the
+  extension.
+
 ### Deferred to system testing
 
 - **Phase 1 — whether Telegram renders a literal `"` and a `%22` in `href`
@@ -223,3 +271,12 @@ no status updates, no restatement of the plan.
 - **Phase 3 — whether one blank line after a bold heading reads as a heading.**
   The bytes are pinned at exactly one; whether that is enough visual separation
   at a phone's line height is an appearance question.
+- **Phase 4 — whether a degraded table's columns *look* aligned on a narrow
+  screen.** The offsets are asserted arithmetically on every row, which is a
+  stronger check than reading a phone; whether `pre` is monospaced with a stable
+  advance width on a given client is not assertable here. A table that is
+  arithmetically aligned and still too wide to read is a design question for
+  Phase 6's splitting, not a defect in this phase.
+- **Phase 4 — whether Telegram renders a degraded image anchor usefully.** The
+  anchor and its label are pinned; whether tapping it opens the image or a
+  browser depends on the client.
