@@ -15,6 +15,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
 	"github.com/Temikus/denkeeper/internal/adapter"
+	"github.com/Temikus/denkeeper/internal/adapter/telegram/tghtml"
 	"github.com/Temikus/denkeeper/internal/voice"
 )
 
@@ -350,25 +351,57 @@ func (a *Adapter) Send(ctx context.Context, msg adapter.OutgoingMessage) error {
 		tgMsg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	}
 
-	// Use explicit parse mode if set, otherwise try Markdown with plain-text
-	// fallback for LLM responses that may break Telegram's parser.
+	// An explicit parse mode is the caller's own markup — the activity log
+	// builds pre-escaped HTML — so it is forwarded unrendered and unretried.
 	if msg.ParseMode != "" {
 		tgMsg.ParseMode = msg.ParseMode
-		_, err = a.sender.Send(tgMsg)
-	} else {
-		tgMsg.ParseMode = "Markdown"
-		_, err = a.sender.Send(tgMsg)
-		if err != nil {
-			a.logger.Debug("markdown send failed, retrying as plain text", "error", err)
-			tgMsg.ParseMode = ""
-			_, err = a.sender.Send(tgMsg)
+		if _, err = a.sender.Send(tgMsg); err != nil {
+			return fmt.Errorf("sending telegram message: %w", err)
 		}
+		return nil
 	}
-	if err != nil {
-		return fmt.Errorf("sending telegram message: %w", err)
+
+	// Default path: the text is CommonMark. Render it to Telegram's HTML subset
+	// locally rather than asking Telegram's legacy Markdown parser to do it.
+	rendered, renderErr := renderOutgoing(msg.Text)
+	if renderErr != nil {
+		a.logger.Debug("render failed, sending as plain text", "error", renderErr)
+		tgMsg.ParseMode = ""
+		if _, err = a.sender.Send(tgMsg); err != nil {
+			return fmt.Errorf("sending telegram message: %w", err)
+		}
+		return nil
+	}
+
+	tgMsg.Text = rendered
+	tgMsg.ParseMode = parseModeHTML
+	if _, err = a.sender.Send(tgMsg); err != nil {
+		// Telegram rejected the HTML. Retry the original markdown once with no
+		// parse mode — never a half-rendered string.
+		a.logger.Debug("html send failed, retrying as plain text", "error", err)
+		tgMsg.Text = msg.Text
+		tgMsg.ParseMode = ""
+		if _, err = a.sender.Send(tgMsg); err != nil {
+			return fmt.Errorf("sending telegram message: %w", err)
+		}
 	}
 
 	return nil
+}
+
+// parseModeHTML is Telegram's HTML parse mode identifier.
+const parseModeHTML = "HTML"
+
+// renderOutgoing renders outgoing markdown to a single Telegram-HTML string.
+//
+// Chunking a reply that exceeds Telegram's message cap is a later change; for
+// now every block goes out in one message.
+func renderOutgoing(text string) (string, error) {
+	blocks, err := tghtml.Render([]byte(text))
+	if err != nil {
+		return "", fmt.Errorf("rendering markdown to telegram html: %w", err)
+	}
+	return tghtml.Join(blocks), nil
 }
 
 // handleCallbackQuery processes an inline keyboard button click. It answers
@@ -562,21 +595,41 @@ func (a *Adapter) SendAndGetID(ctx context.Context, msg adapter.OutgoingMessage)
 
 	tgMsg := tgbotapi.NewMessage(chatID, msg.Text)
 	tgMsg.DisableNotification = msg.Silent
-	if msg.ParseMode != "" {
-		tgMsg.ParseMode = msg.ParseMode
-	} else {
-		tgMsg.ParseMode = "Markdown"
-	}
 
 	if len(msg.Buttons) > 0 {
 		rows := buildButtonRows(msg.Buttons, msg.ButtonLayout)
 		tgMsg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	}
 
+	// An explicit parse mode is the caller's own markup: forwarded unrendered
+	// and unretried, exactly as on the Send path.
+	if msg.ParseMode != "" {
+		tgMsg.ParseMode = msg.ParseMode
+		sent, err := a.sender.Send(tgMsg)
+		if err != nil {
+			return "", fmt.Errorf("sending telegram message: %w", err)
+		}
+		return strconv.Itoa(sent.MessageID), nil
+	}
+
+	rendered, renderErr := renderOutgoing(msg.Text)
+	if renderErr != nil {
+		a.logger.Debug("render failed, sending as plain text", "error", renderErr)
+		tgMsg.ParseMode = ""
+		sent, err := a.sender.Send(tgMsg)
+		if err != nil {
+			return "", fmt.Errorf("sending telegram message: %w", err)
+		}
+		return strconv.Itoa(sent.MessageID), nil
+	}
+
+	tgMsg.Text = rendered
+	tgMsg.ParseMode = parseModeHTML
 	sent, err := a.sender.Send(tgMsg)
-	if err != nil && msg.ParseMode == "" {
-		// Markdown failed, retry plain text.
-		a.logger.Debug("markdown send failed, retrying as plain text", "error", err)
+	if err != nil {
+		// Telegram rejected the HTML: retry the original markdown once, plain.
+		a.logger.Debug("html send failed, retrying as plain text", "error", err)
+		tgMsg.Text = msg.Text
 		tgMsg.ParseMode = ""
 		sent, err = a.sender.Send(tgMsg)
 	}

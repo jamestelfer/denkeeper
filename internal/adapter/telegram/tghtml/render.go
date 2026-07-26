@@ -1,0 +1,442 @@
+// Portions of this file are derived from telegold by Leonid Shevtsov,
+// https://github.com/leonid-shevtsov/telegold (commit 36dc899, MIT licence).
+// See the LICENSE file in this directory for the upstream copyright notice.
+
+// Package tghtml renders CommonMark to the HTML subset accepted by Telegram's
+// HTML parse mode, as an ordered sequence of independently tag-balanced blocks.
+//
+// The node-handling structure and the choice of Telegram tag for each markdown
+// construct are derived from telegold by Leonid Shevtsov
+// (https://github.com/leonid-shevtsov/telegold, commit 36dc899, MIT licence —
+// see the LICENSE file in this directory). Upstream renders to a single flat
+// string via goldmark's renderer interface; this package walks the AST itself so
+// it can emit blocks, which is what lets the chunker split long replies at safe
+// boundaries. Upstream's known defects are documented against the handlers that
+// carry them.
+package tghtml
+
+import (
+	"bufio"
+	"bytes"
+	"strings"
+
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/renderer/html"
+	"github.com/yuin/goldmark/text"
+	"github.com/yuin/goldmark/util"
+)
+
+// Wrapper is an element that encloses a block's content. A block's wrappers are
+// ordered outermost first, so a fenced code block carries {<pre>}, {<code>}.
+//
+// Wrappers exist so an oversized block can be split with its enclosing elements
+// closed at the end of one chunk and reopened at the start of the next. Only
+// blocks that are realistically splittable carry them; everything else puts its
+// markup in Content, which is already tag-balanced.
+type Wrapper struct {
+	Open  string
+	Close string
+}
+
+// Block is one unit of rendered output in which every opened element is closed.
+type Block struct {
+	// Wrappers enclose Content, outermost first.
+	Wrappers []Wrapper
+	// Content is the block's inner HTML. It is already escaped and balanced.
+	Content string
+}
+
+// HTML returns the block's complete HTML: every wrapper opened outermost first,
+// then the content, then every wrapper closed innermost first.
+func (b Block) HTML() string {
+	if len(b.Wrappers) == 0 {
+		return b.Content
+	}
+	var sb strings.Builder
+	for _, w := range b.Wrappers {
+		sb.WriteString(w.Open)
+	}
+	sb.WriteString(b.Content)
+	for i := len(b.Wrappers) - 1; i >= 0; i-- {
+		sb.WriteString(b.Wrappers[i].Close)
+	}
+	return sb.String()
+}
+
+// Len reports the byte length of the block's HTML.
+func (b Block) Len() int { return len(b.HTML()) }
+
+// BlockSeparator joins adjacent blocks. A blank line reproduces the paragraph
+// spacing a reader expects and is what upstream emitted between paragraphs.
+const BlockSeparator = "\n\n"
+
+// Join concatenates blocks in order, separated by BlockSeparator. The result is
+// tag-balanced because every block is.
+func Join(blocks []Block) string {
+	parts := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		parts = append(parts, b.HTML())
+	}
+	return strings.Join(parts, BlockSeparator)
+}
+
+// Render parses src as CommonMark and returns its Telegram-HTML blocks in
+// source order. One top-level markdown node produces at most one block, so a
+// block quotation containing a list is a single block rather than several.
+//
+// Render returns an error only for constructs Telegram's HTML subset cannot
+// represent at all — see UnsupportedError.
+func Render(src []byte) ([]Block, error) {
+	doc := goldmark.DefaultParser().Parse(text.NewReader(src))
+
+	var blocks []Block
+	for node := doc.FirstChild(); node != nil; node = node.NextSibling() {
+		block, ok, err := renderBlockNode(src, node)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			blocks = append(blocks, block)
+		}
+	}
+	return blocks, nil
+}
+
+// thematicBreakText is the separator emitted for a thematic break.
+//
+// Telegram's subset has no hr element, so the separator must be text. Upstream
+// wrote "<hr" and then this string, producing the unterminated "<hr* * *" that
+// Telegram rejects outright; the opening tag is removed rather than repaired.
+const thematicBreakText = "* * *"
+
+// renderBlockNode renders one top-level node. The bool reports whether the node
+// produced a block at all — a node whose content is empty produces none.
+func renderBlockNode(src []byte, node ast.Node) (Block, bool, error) {
+	// Only a top-level code block carries wrappers. Nested in a list item or a
+	// quotation it renders inline, because a block's wrappers describe what
+	// encloses the block as a whole — that is what a split has to reopen.
+	switch n := node.(type) {
+	case *ast.FencedCodeBlock:
+		return codeBlock(src, n, n.Language(src)), true, nil
+	case *ast.CodeBlock:
+		return codeBlock(src, n, nil), true, nil
+	}
+
+	var sb strings.Builder
+	if err := writeBlockContent(&sb, src, node); err != nil {
+		return Block{}, false, err
+	}
+	if sb.Len() == 0 {
+		return Block{}, false, nil
+	}
+	return Block{Content: sb.String()}, true, nil
+}
+
+// codeBlock builds a pre-wrapped code block. Telegram's subset nests code inside
+// pre, in that order.
+func codeBlock(src []byte, n ast.Node, language []byte) Block {
+	open := "<code>"
+	if len(language) > 0 {
+		open = `<code class="language-` + escapeAttr(language) + `">`
+	}
+	return Block{
+		Wrappers: []Wrapper{
+			{Open: "<pre>", Close: "</pre>"},
+			{Open: open, Close: "</code>"},
+		},
+		Content: blockLines(src, n),
+	}
+}
+
+// blockLines renders a block's raw source lines as escaped text. Code content is
+// escaped as text content: a < inside a fence is content, never markup.
+func blockLines(src []byte, n ast.Node) string {
+	var sb strings.Builder
+	lines := n.Lines()
+	for i := 0; i < lines.Len(); i++ {
+		line := lines.At(i)
+		sb.WriteString(escapeText(line.Value(src), true))
+	}
+	return sb.String()
+}
+
+// writeBlockContent renders a block-level node's content, without wrappers.
+// It recurses for constructs that contain other blocks, so a quotation holding a
+// list stays one block.
+func writeBlockContent(sb *strings.Builder, src []byte, node ast.Node) error {
+	switch n := node.(type) {
+	case *ast.Heading:
+		// Telegram has no heading element, so every level renders bold.
+		sb.WriteString("<b>")
+		if err := renderInlineChildren(sb, src, n); err != nil {
+			return err
+		}
+		sb.WriteString("</b>")
+		return nil
+
+	case *ast.ThematicBreak:
+		sb.WriteString(thematicBreakText)
+		return nil
+
+	case *ast.HTMLBlock:
+		return ErrRawHTML
+
+	case *ast.FencedCodeBlock:
+		sb.WriteString(codeBlock(src, n, n.Language(src)).HTML())
+		return nil
+
+	case *ast.CodeBlock:
+		sb.WriteString(codeBlock(src, n, nil).HTML())
+		return nil
+
+	case *ast.Blockquote:
+		// Upstream emits a literal "&gt; " rather than Telegram's blockquote
+		// element, and the quote's internal line breaks are dropped along with
+		// every other soft break. Both are carried here deliberately and fixed
+		// together, because the second is invisible until the first is gone.
+		sb.WriteString("&gt; ")
+		return writeChildBlocks(sb, src, n, "\n")
+
+	case *ast.List:
+		return writeChildBlocks(sb, src, n, "\n")
+
+	case *ast.ListItem:
+		// Upstream writes a constant "- " for every item at every depth, so
+		// ordered lists lose their numbering and nested lists flatten. Both are
+		// carried here and fixed together.
+		sb.WriteString("- ")
+		return writeChildBlocks(sb, src, n, "\n")
+	}
+
+	// Paragraph, TextBlock and anything else block-shaped: inline content.
+	return renderInlineChildren(sb, src, node)
+}
+
+// writeChildBlocks renders a node's block-level children, joined by sep, and
+// skips children that render empty so the separator never doubles.
+func writeChildBlocks(sb *strings.Builder, src []byte, node ast.Node, sep string) error {
+	first := true
+	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
+		var inner strings.Builder
+		if err := writeBlockContent(&inner, src, child); err != nil {
+			return err
+		}
+		if inner.Len() == 0 {
+			continue
+		}
+		if !first {
+			sb.WriteString(sep)
+		}
+		sb.WriteString(inner.String())
+		first = false
+	}
+	return nil
+}
+
+// renderInlineChildren renders a node's inline descendants into sb.
+func renderInlineChildren(sb *strings.Builder, src []byte, node ast.Node) error {
+	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
+		if err := renderInline(sb, src, child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// renderInline renders a single inline node.
+func renderInline(sb *strings.Builder, src []byte, node ast.Node) error {
+	switch n := node.(type) {
+	case *ast.Text:
+		sb.WriteString(textContent(src, n))
+		return nil
+	case *ast.Emphasis:
+		return renderEmphasis(sb, src, n)
+	case *ast.CodeSpan:
+		renderCodeSpan(sb, src, n)
+		return nil
+	case *ast.String:
+		sb.WriteString(stringContent(n))
+		return nil
+	case *ast.Link:
+		return renderLink(sb, src, n)
+	case *ast.AutoLink:
+		return renderAutoLink(sb, src, n)
+	case *ast.Image:
+		return ErrImage
+	case *ast.RawHTML:
+		return ErrRawHTML
+	}
+	return renderInlineChildren(sb, src, node)
+}
+
+// renderLink emits an anchor when the destination's scheme is allowlisted, and
+// the label alone otherwise.
+//
+// Dropping the anchor entirely is a correction of upstream, which kept the
+// anchor and blanked its href. An empty-href anchor is also a plausible Telegram
+// rejection, which would route the whole message to the plain-text fallback.
+func renderLink(sb *strings.Builder, src []byte, n *ast.Link) error {
+	if !schemeAllowed(n.Destination) {
+		// Label only. The destination is not emitted at all, in any form:
+		// Telegram autolinks visible text after parsing, so leaving a rejected
+		// destination in the text could hand it back a live link.
+		return renderInlineChildren(sb, src, n)
+	}
+	sb.WriteString(`<a href="`)
+	sb.WriteString(escapeAttr(n.Destination))
+	sb.WriteString(`">`)
+	if err := renderInlineChildren(sb, src, n); err != nil {
+		return err
+	}
+	sb.WriteString(`</a>`)
+	return nil
+}
+
+// renderAutoLink emits an anchor for a bracketed autolink. Upstream wrote the
+// href unconditionally, bypassing its scheme check entirely; this routes through
+// the same allowlist as an ordinary link.
+func renderAutoLink(sb *strings.Builder, src []byte, n *ast.AutoLink) error {
+	dest := n.URL(src)
+	if n.AutoLinkType == ast.AutoLinkEmail {
+		dest = emailDestination(dest)
+	}
+	label := escapeText(n.Label(src), true)
+	if !schemeAllowed(dest) {
+		sb.WriteString(label)
+		return nil
+	}
+	sb.WriteString(`<a href="`)
+	sb.WriteString(escapeAttr(dest))
+	sb.WriteString(`">`)
+	sb.WriteString(label)
+	sb.WriteString(`</a>`)
+	return nil
+}
+
+// renderCodeSpan emits Telegram's inline <code> element.
+//
+// Unlike upstream, the children are not type-asserted to *ast.Text. A code span
+// can hold other node kinds, and an unchecked assertion would panic inside the
+// adapter's send path on user-supplied content.
+func renderCodeSpan(sb *strings.Builder, src []byte, n *ast.CodeSpan) {
+	sb.WriteString("<code>")
+	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
+		switch child := c.(type) {
+		case *ast.Text:
+			value := child.Segment.Value(src)
+			// A span that wraps across a source line ends the segment with a
+			// newline; CommonMark renders that as a single space.
+			if bytes.HasSuffix(value, []byte("\n")) {
+				sb.WriteString(escapeText(value[:len(value)-1], true))
+				sb.WriteString(" ")
+				continue
+			}
+			sb.WriteString(escapeText(value, true))
+		case *ast.String:
+			sb.WriteString(stringContent(child))
+		default:
+			// Unknown inline kind inside a code span: emit its text content
+			// rather than dropping it or panicking.
+			var inner strings.Builder
+			_ = renderInlineChildren(&inner, src, c)
+			sb.WriteString(inner.String())
+		}
+	}
+	sb.WriteString("</code>")
+}
+
+// stringContent renders an ast.String, which carries its bytes inline rather
+// than referencing a source segment.
+func stringContent(n *ast.String) string {
+	if n.IsCode() {
+		return string(n.Value)
+	}
+	return escapeText(n.Value, n.IsRaw())
+}
+
+// renderEmphasis wraps its children in Telegram's italic or bold element.
+// Telegram's subset has no <em>/<strong>, so level 1 is <i> and level 2 is <b>.
+func renderEmphasis(sb *strings.Builder, src []byte, n *ast.Emphasis) error {
+	tag := "i"
+	if n.Level == 2 {
+		tag = "b"
+	}
+	sb.WriteString("<" + tag + ">")
+	if err := renderInlineChildren(sb, src, n); err != nil {
+		return err
+	}
+	sb.WriteString("</" + tag + ">")
+	return nil
+}
+
+// textContent renders a text node's segment as Telegram-safe HTML text.
+func textContent(src []byte, n *ast.Text) string {
+	value := n.Segment.Value(src)
+	if n.IsRaw() {
+		return escapeText(value, true)
+	}
+	return escapeText(value, false)
+}
+
+// escapeText converts markdown text content to Telegram-safe HTML text.
+//
+// Telegram documents exactly three characters as needing escapes in HTML parse
+// mode: <, > and &. goldmark's escaper also emits &quot; for a double quote,
+// which Telegram does not document as a supported entity, so the quote is
+// restored to its literal form. A literal " in text content is unambiguous to
+// any parser; a named entity depends on the parser's entity table.
+//
+// raw selects goldmark's RawWrite, which escapes without resolving character
+// references or unescaping backslash-escaped punctuation.
+func escapeText(value []byte, raw bool) string {
+	var buf bytes.Buffer
+	w := bufio.NewWriter(&buf)
+	if raw {
+		html.DefaultWriter.RawWrite(w, value)
+	} else {
+		// Write resolves character references and drops the backslash from
+		// backslash-escaped punctuation, which is what keeps a literal
+		// underscore from reaching the user with a backslash in front of it.
+		html.DefaultWriter.Write(w, value)
+	}
+	_ = w.Flush()
+	return restoreQuotes(buf.String())
+}
+
+// escapeAttr escapes a destination for use inside a double-quoted attribute.
+//
+// Attribute context is not text content: a literal double quote would end the
+// attribute, so here the quote must stay escaped. The destination is otherwise
+// emitted as written — percent-encoding it would alter URLs, and preserving them
+// byte-for-byte is the defect this package exists to fix.
+func escapeAttr(dest []byte) string {
+	var sb strings.Builder
+	sb.Grow(len(dest))
+	for _, c := range dest {
+		switch c {
+		case '&':
+			sb.WriteString("&amp;")
+		case '<':
+			sb.WriteString("&lt;")
+		case '>':
+			sb.WriteString("&gt;")
+		case '"':
+			sb.WriteString("%22")
+		default:
+			sb.WriteByte(c)
+		}
+	}
+	return sb.String()
+}
+
+// restoreQuotes turns goldmark's &quot; back into a literal double quote. Only
+// goldmark's escaper produces that sequence, and only from a literal quote
+// byte, so the substitution cannot corrupt a quote the source escaped itself:
+// source "&amp;quot;" renders as "&amp;quot;", which does not contain "&quot;".
+func restoreQuotes(s string) string {
+	return strings.ReplaceAll(s, "&quot;", `"`)
+}
+
+// util is imported for its BufWriter contract, which *bufio.Writer satisfies.
+var _ util.BufWriter = (*bufio.Writer)(nil)
