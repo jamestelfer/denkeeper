@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Temikus/denkeeper/internal/adapter"
+	"github.com/Temikus/denkeeper/internal/adapter/telegram"
 	"github.com/Temikus/denkeeper/internal/audit"
 	"github.com/Temikus/denkeeper/internal/llm"
 
@@ -1486,8 +1487,11 @@ type pendingApproval struct {
 
 const (
 	// activityChunkMaxBytes leaves headroom under Telegram's 4096-char cap so
-	// the approval section can be appended without overflowing.
-	activityChunkMaxBytes = 3500
+	// the approval section can be appended without overflowing. It is the
+	// adapter's own send limit: the activity log renders Telegram HTML and
+	// chunks it here rather than through the adapter, so the two paths have to
+	// agree on the cap.
+	activityChunkMaxBytes = telegram.MessageChunkLimit
 	// approvalArgsMaxChars truncates oversized tool argument payloads so a
 	// single approval cannot blow past the message cap on its own. Counted in
 	// Unicode code points so multi-byte characters aren't split mid-sequence.

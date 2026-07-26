@@ -349,15 +349,18 @@ func (a *Adapter) Send(ctx context.Context, msg adapter.OutgoingMessage) error {
 // parseModeHTML is Telegram's HTML parse mode identifier.
 const parseModeHTML = "HTML"
 
-// messageChunkLimit is the largest chunk the adapter will send, in bytes of
+// MessageChunkLimit is the largest chunk the adapter will send, in bytes of
 // rendered HTML.
 //
 // Telegram's own cap is 4096 characters of the entity-stripped text, counted in
 // UTF-16 code units. Counting raw HTML bytes over-counts against that, which is
-// conservative and costs only the occasional extra message. The value matches
-// activityChunkMaxBytes in internal/agent/dispatcher.go so the two chunked paths
-// behave alike.
-const messageChunkLimit = 3500
+// conservative and costs only the occasional extra message.
+//
+// Exported because the dispatcher's activity log builds Telegram HTML and
+// chunks it itself, against this same cap. Sharing the constant is what keeps
+// the two chunked paths in step; they previously carried the same literal and
+// nothing tied them together.
+const MessageChunkLimit = 3500
 
 // sendText renders msg's text and delivers it, returning the message ID of the
 // last message sent. It is the shared body of Send and SendAndGetID, so the two
@@ -461,7 +464,7 @@ func renderChunks(text string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rendering markdown to telegram html: %w", err)
 	}
-	chunks, err := tghtml.Chunk(blocks, messageChunkLimit)
+	chunks, err := tghtml.Chunk(blocks, MessageChunkLimit)
 	if err != nil {
 		return nil, fmt.Errorf("chunking telegram html: %w", err)
 	}

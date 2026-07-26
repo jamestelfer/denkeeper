@@ -44,8 +44,8 @@ func TestSend_LongReplyIsSentAsSeveralMessagesInOrder(t *testing.T) {
 		if m.ParseMode != "HTML" {
 			t.Errorf("chunk %d ParseMode = %q, want HTML", i, m.ParseMode)
 		}
-		if len(m.Text) > messageChunkLimit {
-			t.Errorf("chunk %d is %d bytes, over the %d-byte limit", i, len(m.Text), messageChunkLimit)
+		if len(m.Text) > MessageChunkLimit {
+			t.Errorf("chunk %d is %d bytes, over the %d-byte limit", i, len(m.Text), MessageChunkLimit)
 		}
 		if m.ChatID != 12345 {
 			t.Errorf("chunk %d ChatID = %d, want 12345", i, m.ChatID)
@@ -363,7 +363,7 @@ func TestSend_ExplicitParseModeIsNotChunked(t *testing.T) {
 	bot := newFakeBot()
 	a := newWithSender(bot, nil, testLogger(), nil)
 
-	long := "<b>" + strings.Repeat("x", messageChunkLimit+500) + "</b>"
+	long := "<b>" + strings.Repeat("x", MessageChunkLimit+500) + "</b>"
 	if err := a.Send(context.Background(), adapter.OutgoingMessage{
 		ExternalID: "12345",
 		Text:       long,
@@ -385,13 +385,9 @@ func TestSend_ExplicitParseModeIsNotChunked(t *testing.T) {
 // decision. The chunker counts raw HTML bytes while Telegram counts the
 // entity-stripped text in UTF-16 code units, so the count is conservative
 // already, but it must still leave room under the cap.
-//
-// The constant also matches activityChunkMaxBytes in internal/agent, which is
-// unexported there and so cannot be asserted from here — that coupling is
-// documented at the constant and unenforced.
 func TestMessageChunkLimit_LeavesHeadroomBelowTelegramsCap(t *testing.T) {
 	const telegramCap = 4096
-	if messageChunkLimit >= telegramCap {
-		t.Errorf("messageChunkLimit = %d, want headroom below Telegram's %d", messageChunkLimit, telegramCap)
+	if MessageChunkLimit >= telegramCap {
+		t.Errorf("MessageChunkLimit = %d, want headroom below Telegram's %d", MessageChunkLimit, telegramCap)
 	}
 }
