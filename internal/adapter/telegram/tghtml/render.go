@@ -18,6 +18,7 @@ package tghtml
 import (
 	"bufio"
 	"bytes"
+	"strconv"
 	"strings"
 
 	"github.com/yuin/goldmark"
@@ -106,9 +107,13 @@ func Render(src []byte) ([]Block, error) {
 // thematicBreakText is the separator emitted for a thematic break.
 //
 // Telegram's subset has no hr element, so the separator must be text. Upstream
-// wrote "<hr" and then this string, producing the unterminated "<hr* * *" that
+// wrote "<hr" and then "* * *", producing the unterminated "<hr* * *" that
 // Telegram rejects outright; the opening tag is removed rather than repaired.
-const thematicBreakText = "* * *"
+//
+// Em dashes rather than upstream's "* * *": asterisks read as unrendered markdown
+// source, whereas a run of em dashes abuts into a continuous line. Contains no
+// character that needs escaping.
+const thematicBreakText = "——————————"
 
 // renderBlockNode renders one top-level node. The bool reports whether the node
 // produced a block at all — a node whose content is empty produces none.
@@ -121,6 +126,18 @@ func renderBlockNode(src []byte, node ast.Node) (Block, bool, error) {
 		return codeBlock(src, n, n.Language(src)), true, nil
 	case *ast.CodeBlock:
 		return codeBlock(src, n, nil), true, nil
+	case *ast.Blockquote:
+		var sb strings.Builder
+		if err := writeChildBlocks(&sb, src, n, BlockSeparator); err != nil {
+			return Block{}, false, err
+		}
+		if sb.Len() == 0 {
+			return Block{}, false, nil
+		}
+		return Block{
+			Wrappers: []Wrapper{{Open: "<blockquote>", Close: "</blockquote>"}},
+			Content:  sb.String(),
+		}, true, nil
 	}
 
 	var sb strings.Builder
@@ -191,26 +208,124 @@ func writeBlockContent(sb *strings.Builder, src []byte, node ast.Node) error {
 		return nil
 
 	case *ast.Blockquote:
-		// Upstream emits a literal "&gt; " rather than Telegram's blockquote
-		// element, and the quote's internal line breaks are dropped along with
-		// every other soft break. Both are carried here deliberately and fixed
-		// together, because the second is invisible until the first is gone.
-		sb.WriteString("&gt; ")
-		return writeChildBlocks(sb, src, n, "\n")
+		// A quotation reached here is nested inside another block — another
+		// quotation, or a list item. Telegram represents a quotation as a
+		// message entity spanning a text range, and such an entity cannot
+		// contain another of its own kind, so the nesting is flattened to the
+		// enclosing level rather than emitting markup Telegram would reject.
+		// Whether a reader can tell the levels apart is an appearance question.
+		return writeChildBlocks(sb, src, n, BlockSeparator)
 
 	case *ast.List:
-		return writeChildBlocks(sb, src, n, "\n")
+		return writeList(sb, src, n, 0)
 
 	case *ast.ListItem:
-		// Upstream writes a constant "- " for every item at every depth, so
-		// ordered lists lose their numbering and nested lists flatten. Both are
-		// carried here and fixed together.
-		sb.WriteString("- ")
+		// Reached only if an item appears outside a list, which the parser does
+		// not produce. Rendered without a marker rather than dropped.
 		return writeChildBlocks(sb, src, n, "\n")
 	}
 
 	// Paragraph, TextBlock and anything else block-shaped: inline content.
 	return renderInlineChildren(sb, src, node)
+}
+
+// listIndent is one level of nested-list indentation.
+//
+// Telegram's HTML subset has no list elements, so nesting has to be shown with
+// text. Ordinary spaces are safe because Telegram's HTML parse mode is not an
+// HTML renderer: the tags become message entities over the message text, and the
+// text — whitespace included — is kept as written. The documented blockquote
+// example relies on the same property by putting literal newlines inside the
+// element, where a real HTML renderer would collapse them to spaces.
+const listIndent = "  "
+
+// maxListIndentDepth caps how deep indentation grows. Beyond this, further
+// nesting reuses the deepest indent rather than marching a list off the side of a
+// narrow screen.
+const maxListIndentDepth = 6
+
+// writeList renders a list, one item per line, each prefixed with its indent and
+// marker.
+//
+// Upstream wrote a constant "- " for every item at every depth and never
+// inspected ast.List.IsOrdered or Start, so ordered lists became bullets and
+// nested lists flattened. Both come from the same place and are fixed together.
+func writeList(sb *strings.Builder, src []byte, list *ast.List, depth int) error {
+	ordinal := list.Start
+	indent := listIndentFor(depth)
+
+	first := true
+	for item := list.FirstChild(); item != nil; item = item.NextSibling() {
+		var inner strings.Builder
+		if err := writeListItem(&inner, src, item, depth); err != nil {
+			return err
+		}
+		if inner.Len() == 0 {
+			continue
+		}
+		if !first {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(indent)
+		if list.IsOrdered() {
+			// Start is the list's own first ordinal, so a list beginning at 5 is
+			// honoured rather than renumbered from 1.
+			sb.WriteString(strconv.Itoa(ordinal))
+			sb.WriteString(". ")
+			ordinal++
+		} else {
+			sb.WriteString("- ")
+		}
+		sb.WriteString(inner.String())
+		first = false
+	}
+	return nil
+}
+
+// writeListItem renders one item's content. A nested list becomes its own set of
+// lines, indented one level deeper; everything else is the item's own text.
+func writeListItem(sb *strings.Builder, src []byte, item ast.Node, depth int) error {
+	var text strings.Builder
+	var nested []string
+
+	for child := item.FirstChild(); child != nil; child = child.NextSibling() {
+		if list, ok := child.(*ast.List); ok {
+			var sub strings.Builder
+			if err := writeList(&sub, src, list, depth+1); err != nil {
+				return err
+			}
+			if sub.Len() > 0 {
+				nested = append(nested, sub.String())
+			}
+			continue
+		}
+		var part strings.Builder
+		if err := writeBlockContent(&part, src, child); err != nil {
+			return err
+		}
+		if part.Len() == 0 {
+			continue
+		}
+		if text.Len() > 0 {
+			text.WriteString("\n")
+		}
+		text.WriteString(part.String())
+	}
+
+	sb.WriteString(text.String())
+	for _, n := range nested {
+		sb.WriteString("\n")
+		sb.WriteString(n)
+	}
+	return nil
+}
+
+// listIndentFor returns the indent for a nesting depth, capped.
+func listIndentFor(depth int) string {
+	if depth > maxListIndentDepth {
+		depth = maxListIndentDepth
+	}
+	return strings.Repeat(listIndent, depth)
 }
 
 // writeChildBlocks renders a node's block-level children, joined by sep, and
@@ -249,6 +364,14 @@ func renderInline(sb *strings.Builder, src []byte, node ast.Node) error {
 	switch n := node.(type) {
 	case *ast.Text:
 		sb.WriteString(textContent(src, n))
+		// A text node carries a flag for the break that follows it. Upstream
+		// inspected neither, so the last word of a wrapped source line fused to
+		// the first word of the next — measured as "alpha betagamma delta".
+		// Telegram's HTML parse mode does not collapse whitespace: tags become
+		// message entities over the text, so a newline character is a newline.
+		if n.HardLineBreak() || n.SoftLineBreak() {
+			sb.WriteString("\n")
+		}
 		return nil
 	case *ast.Emphasis:
 		return renderEmphasis(sb, src, n)

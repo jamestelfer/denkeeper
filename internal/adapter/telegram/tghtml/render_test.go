@@ -2,6 +2,7 @@ package tghtml
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -363,19 +364,36 @@ func TestRender_CodeBlockContentIsEscaped(t *testing.T) {
 	}
 }
 
-// TestRender_ThematicBreakEmitsNoElement covers R2 and R5 at the point upstream
-// breaks both: it writes "<hr" and then the separator, producing "<hr* * *" —
-// an unterminated tag Telegram rejects outright. Telegram's subset has no hr, so
-// the separator has to be text.
+// TestRender_ThematicBreakEmitsNoElement covers R7, and R2 and R5 at the point
+// upstream breaks both: it writes "<hr" and then a separator, producing the
+// unterminated "<hr* * *" that Telegram rejects outright. Telegram's subset has
+// no hr element, so the separator has to be text.
+//
+// A run of em dashes is chosen over upstream's "* * *", which reads as unrendered
+// markdown source rather than as a rule; em dashes abut into a continuous line.
 func TestRender_ThematicBreakEmitsNoElement(t *testing.T) {
-	got := renderOne(t, "---")
-	if strings.Contains(got, "<") {
-		t.Errorf("Render(\"---\") = %q — must contain no < at all (upstream emitted %q)", got, "<hr* * *")
+	for _, src := range []string{"---", "***", "___", "- - -"} {
+		got := renderOne(t, src)
+		if strings.Contains(got, "<") {
+			t.Errorf("Render(%q) = %q — must contain no < at all (upstream emitted %q)", src, got, "<hr* * *")
+		}
+		if got != thematicBreakText {
+			t.Errorf("Render(%q) = %q, want %q", src, got, thematicBreakText)
+		}
+		assertTagBalanced(t, got)
 	}
-	if got == "" {
-		t.Error("a thematic break must render as something visible")
+}
+
+// TestRender_ThematicBreakSeparatorIsPinned fixes the chosen bytes so the
+// decision cannot drift silently. Whether it looks like a rule on a given client
+// is an appearance question for system testing.
+func TestRender_ThematicBreakSeparatorIsPinned(t *testing.T) {
+	if thematicBreakText != "——————————" {
+		t.Errorf("thematicBreakText = %q, want ten em dashes", thematicBreakText)
 	}
-	assertTagBalanced(t, got)
+	if strings.ContainsAny(thematicBreakText, "<>&") {
+		t.Errorf("thematicBreakText = %q must not contain a character that needs escaping", thematicBreakText)
+	}
 }
 
 // TestRender_NoConstructIsSilentlyDropped is the content-preservation guard. A
@@ -446,9 +464,234 @@ func TestRender_EveryBlockIsTagBalanced(t *testing.T) {
 		t.Fatal("no blocks rendered")
 	}
 	for i, b := range blocks {
-		t.Run("block"+string(rune('0'+i)), func(t *testing.T) {
+		t.Run("block"+strconv.Itoa(i), func(t *testing.T) {
 			assertTagBalanced(t, b.HTML())
 		})
+	}
+}
+
+// TestRender_SoftLineBreakEmitsNewline covers R6.
+//
+// Measured before the fix: "alpha beta\ngamma delta" rendered as
+// "alpha betagamma delta" — the last word of one source line fused to the first
+// word of the next. LLM output is wrapped prose, so this corrupted a large share
+// of ordinary replies.
+func TestRender_SoftLineBreakEmitsNewline(t *testing.T) {
+	const src = "alpha beta\ngamma delta"
+	got := renderOne(t, src)
+	if got != src {
+		t.Errorf("Render(%q) = %q, want %q", src, got, src)
+	}
+	if strings.Contains(got, "betagamma") {
+		t.Errorf("Render(%q) = %q — words fused across the line break", src, got)
+	}
+}
+
+// TestRender_HardLineBreakEmitsNewline covers R34.
+//
+// Measured before the fix: "alpha␠␠\ngamma" rendered as "alphagamma". R6 covered
+// only the soft case, but the failure and the fix are identical.
+func TestRender_HardLineBreakEmitsNewline(t *testing.T) {
+	for _, src := range []string{"alpha  \ngamma", "alpha\\\ngamma"} {
+		got := renderOne(t, src)
+		if got != "alpha\ngamma" {
+			t.Errorf("Render(%q) = %q, want %q", src, got, "alpha\ngamma")
+		}
+	}
+}
+
+// TestRender_WrappedProseNeverFusesWords is the realistic form of R6 and R34.
+// A per-construct test can pass while ordinary wrapped prose still breaks, so
+// this renders a multi-paragraph reply wrapped at 80 columns and checks every
+// source line boundary.
+func TestRender_WrappedProseNeverFusesWords(t *testing.T) {
+	src := strings.Join([]string{
+		"The quick brown fox jumps over the lazy dog and continues running until it",
+		"reaches the far side of the meadow where the grass grows tall and green in",
+		"the summer sunshine without any interruption whatsoever from the weather.",
+		"",
+		"A second paragraph follows the first one here so that the block boundary is",
+		"exercised alongside the soft line breaks inside each individual paragraph.",
+	}, "\n")
+
+	blocks, err := Render([]byte(src))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	got := Join(blocks)
+
+	// Every word in the source must appear as a whole word in the output.
+	for _, word := range strings.Fields(src) {
+		if !containsWord(got, word) {
+			t.Errorf("word %q is not present as a whole word in %q", word, got)
+		}
+	}
+	// And the source's line count must survive.
+	if wantLines, gotLines := strings.Count(src, "\n"), strings.Count(got, "\n"); gotLines != wantLines {
+		t.Errorf("newline count = %d, want %d — a line break was dropped", gotLines, wantLines)
+	}
+}
+
+// containsWord reports whether s contains word delimited by whitespace or the
+// string boundary, which is what catches a fused pair like "dogA".
+func containsWord(s, word string) bool {
+	for _, field := range strings.Fields(s) {
+		if strings.Trim(field, ".,;:") == strings.Trim(word, ".,;:") {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRender_BlockquoteEmitsElement covers R8, and both of its defects.
+//
+// Measured before the fix: "> line one\n> line two" rendered as
+// "&gt; line oneline two" — a literal &gt; instead of the supported element, and
+// the quote's internal line break dropped through the same path as R6. Fixing
+// only the visible one leaves the quotation's lines fused.
+func TestRender_BlockquoteEmitsElement(t *testing.T) {
+	got := renderOne(t, "> line one\n> line two")
+
+	if !strings.HasPrefix(got, "<blockquote>") || !strings.HasSuffix(got, "</blockquote>") {
+		t.Errorf("Render() = %q, want a blockquote element", got)
+	}
+	if strings.Contains(got, "&gt;") {
+		t.Errorf("Render() = %q — must not emit a literal &gt; quote marker", got)
+	}
+	if got != "<blockquote>line one\nline two</blockquote>" {
+		t.Errorf("Render() = %q, want the two lines separated by a newline", got)
+	}
+	assertTagBalanced(t, got)
+}
+
+func TestRender_BlockquoteWithMultipleParagraphs(t *testing.T) {
+	got := renderOne(t, "> first para\n>\n> second para")
+	want := "<blockquote>first para\n\nsecond para</blockquote>"
+	if got != want {
+		t.Errorf("Render() = %q, want %q", got, want)
+	}
+	assertTagBalanced(t, got)
+}
+
+// TestRender_NestedBlockquoteIsFlattened records the nesting decision. Telegram
+// represents a quotation as a message entity over a text range, and a blockquote
+// entity cannot contain another, so a nested quote collapses to one level rather
+// than emitting markup Telegram would reject.
+func TestRender_NestedBlockquoteIsFlattened(t *testing.T) {
+	got := renderOne(t, "> outer\n> > inner")
+
+	if n := strings.Count(got, "<blockquote>"); n != 1 {
+		t.Errorf("Render() = %q — want exactly one blockquote element, got %d", got, n)
+	}
+	if !strings.Contains(got, "outer") || !strings.Contains(got, "inner") {
+		t.Errorf("Render() = %q — both quote levels' text must survive", got)
+	}
+	assertTagBalanced(t, got)
+}
+
+// TestRender_NestedListIndents covers R9.
+//
+// Measured before the fix: "- parent\n    - child" rendered as
+// "- parent\n- child" — upstream writes a constant "- " at every depth, so the
+// nesting was flattened and the structure lost.
+//
+// Telegram's HTML subset has no list elements, so the indent must be textual.
+// Ordinary spaces are used: Telegram's HTML parse mode is not an HTML renderer —
+// tags are parsed into message entities over the text and the text is kept
+// verbatim, which is the same property the newline fixes above rely on and which
+// the documented blockquote example demonstrates by putting literal newlines
+// inside the element.
+func TestRender_NestedListIndents(t *testing.T) {
+	got := renderOne(t, "- parent\n    - child")
+	want := "- parent\n  - child"
+	if got != want {
+		t.Errorf("Render() = %q, want %q", got, want)
+	}
+}
+
+func TestRender_NestedListIndentsPerLevel(t *testing.T) {
+	src := "- one\n    - two\n        - three"
+	got := renderOne(t, src)
+	want := "- one\n  - two\n    - three"
+	if got != want {
+		t.Errorf("Render(%q) = %q, want %q", src, got, want)
+	}
+
+	// Nesting depth must be recoverable from the output.
+	for i, line := range strings.Split(got, "\n") {
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		if want := i * len(listIndent); indent != want {
+			t.Errorf("line %d %q has indent %d, want %d", i, line, indent, want)
+		}
+	}
+}
+
+// TestRender_OrderedListKeepsOrdinals covers R35.
+//
+// Measured before the fix: "1. first\n2. second" rendered as
+// "- first\n- second" — numbered steps silently became bullets.
+func TestRender_OrderedListKeepsOrdinals(t *testing.T) {
+	got := renderOne(t, "1. first\n2. second\n3. third")
+	want := "1. first\n2. second\n3. third"
+	if got != want {
+		t.Errorf("Render() = %q, want %q", got, want)
+	}
+}
+
+// TestRender_OrderedListHonoursNonOneStart guards against a fix that simply
+// counts items from the top, which would silently renumber the list.
+func TestRender_OrderedListHonoursNonOneStart(t *testing.T) {
+	got := renderOne(t, "5. five\n6. six")
+	want := "5. five\n6. six"
+	if got != want {
+		t.Errorf("Render() = %q, want %q", got, want)
+	}
+}
+
+func TestRender_NestedOrderedListInsideBullet(t *testing.T) {
+	got := renderOne(t, "- parent\n    1. first\n    2. second")
+	want := "- parent\n  1. first\n  2. second"
+	if got != want {
+		t.Errorf("Render() = %q, want %q", got, want)
+	}
+}
+
+// KitchenSinkSource contains every construct fixed in this phase, together, so
+// the fixes are shown not to interfere with each other. Exported for the adapter
+// tests, which send this same document through the send path.
+const KitchenSinkSource = "Wrapped prose that runs across\ntwo source lines here.\n\n" +
+	"A hard break line  \nfollows immediately.\n\n" +
+	"---\n\n" +
+	"> quoted line one\n> quoted line two\n\n" +
+	"- parent bullet\n    - child bullet\n\n" +
+	"1. first step\n2. second step\n"
+
+// KitchenSinkHTML is the expected rendering of KitchenSinkSource.
+const KitchenSinkHTML = "Wrapped prose that runs across\ntwo source lines here." +
+	"\n\n" + "A hard break line\nfollows immediately." +
+	"\n\n" + "——————————" +
+	"\n\n" + "<blockquote>quoted line one\nquoted line two</blockquote>" +
+	"\n\n" + "- parent bullet\n  - child bullet" +
+	"\n\n" + "1. first step\n2. second step"
+
+// TestRender_KitchenSink covers R6, R7, R8, R9, R34 and R35 in one document.
+// Each construct has its own case above; this one exists because a per-construct
+// fix can pass while two constructs in sequence still interfere.
+func TestRender_KitchenSink(t *testing.T) {
+	blocks, err := Render([]byte(KitchenSinkSource))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	got := Join(blocks)
+	if got != KitchenSinkHTML {
+		t.Errorf("Render() mismatch\n got: %q\nwant: %q", got, KitchenSinkHTML)
+	}
+	for i, b := range blocks {
+		assertTagBalanced(t, b.HTML())
+		if b.Len() == 0 {
+			t.Errorf("block %d is empty", i)
+		}
 	}
 }
 

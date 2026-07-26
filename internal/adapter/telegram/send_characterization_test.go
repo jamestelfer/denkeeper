@@ -349,6 +349,54 @@ func TestSend_DebugToggleTextIsUnaffected(t *testing.T) {
 	}
 }
 
+// kitchenSinkMarkdown exercises every construct fixed alongside the renderer's
+// vendored-in defects. The renderer's own golden test pins the exact bytes; this
+// asserts the document survives the send path intact and triggers no fallback.
+const kitchenSinkMarkdown = "Wrapped prose that runs across\ntwo source lines here.\n\n" +
+	"A hard break line  \nfollows immediately.\n\n" +
+	"---\n\n" +
+	"> quoted line one\n> quoted line two\n\n" +
+	"- parent bullet\n    - child bullet\n\n" +
+	"1. first step\n2. second step\n"
+
+func TestSend_KitchenSinkDocumentTriggersNoFallback(t *testing.T) {
+	bot := newFakeBot()
+	a := newWithSender(bot, nil, testLogger(), nil)
+
+	if err := a.Send(context.Background(), adapter.OutgoingMessage{
+		ExternalID: "12345",
+		Text:       kitchenSinkMarkdown,
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if got := bot.sendCount(); got != 1 {
+		t.Fatalf("send count = %d, want 1 — no fallback may trigger", got)
+	}
+	msg := bot.lastMessage(t)
+	if msg.ParseMode != "HTML" {
+		t.Fatalf("ParseMode = %q, want HTML", msg.ParseMode)
+	}
+
+	for _, want := range []string{
+		"across\ntwo source lines",                                  // soft line break
+		"A hard break line\nfollows",                                // hard line break
+		"<blockquote>quoted line one\nquoted line two</blockquote>", // quotation, both defects
+		"- parent bullet\n  - child bullet",                         // nested list indentation
+		"1. first step\n2. second step",                             // ordered list ordinals
+	} {
+		if !strings.Contains(msg.Text, want) {
+			t.Errorf("outbound text is missing %q\ngot: %q", want, msg.Text)
+		}
+	}
+	if strings.Contains(msg.Text, "&gt;") {
+		t.Errorf("outbound text %q still contains a literal quote marker", msg.Text)
+	}
+	if strings.Contains(msg.Text, "<hr") {
+		t.Errorf("outbound text %q contains the malformed thematic break", msg.Text)
+	}
+}
+
 // recordingTTS captures the text handed to speech synthesis.
 type recordingTTS struct {
 	text string

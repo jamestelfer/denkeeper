@@ -6,7 +6,7 @@
 
 - [x] Phase 0: Bot seam and characterization baseline
 - [x] Phase 1: Vendored renderer and the HTML send path
-- [ ] Phase 2: Fix the vendored-in defects
+- [x] Phase 2: Fix the vendored-in defects
 - [ ] Phase 3: Inline and block typography
 - [ ] Phase 4: Degrade tables and images
 - [ ] Phase 5: Chunker and multi-message send
@@ -124,6 +124,42 @@ no status updates, no restatement of the plan.
   `coreos/go-oidc`, `dop251/goja` and `pelletier/go-toml`. The replan trigger about
   an unrelated forced upgrade did not fire.
 
+- **Phase 2 — the R9 indent question is settled by what Telegram's HTML mode
+  actually is, so ordinary spaces are used.** Telegram's HTML parse mode is not an
+  HTML renderer: the tags are parsed into `MessageEntity` offsets over the message
+  text, and the text is kept verbatim. The documented `<blockquote>` example
+  demonstrates it by placing literal newlines inside the element and describing
+  them as separate lines — a real HTML renderer would collapse those to spaces.
+  The same property is what makes R6's and R34's newline fixes work at all, and
+  what the pre-existing `\n\n` between paragraphs already relied on. Two spaces per
+  level, no non-breaking space needed.
+- **Phase 2 — nested-list indentation is capped at six levels.** Beyond that,
+  further nesting reuses the deepest indent rather than marching the list off the
+  side of a narrow screen. Content is never dropped, only the indent stops growing.
+- **Phase 2 — a nested blockquote is flattened to one level.** Telegram represents
+  a quotation as a message entity spanning a text range, and such an entity cannot
+  contain another of its own kind, so `> outer\n> > inner` emits a single
+  `blockquote` containing both texts. The same rule applies to a quotation inside a
+  list item, which answers the plan's second open question with one rule rather
+  than two. Both levels' text always survives.
+- **Phase 2 — the thematic-break separator is ten em dashes, not upstream's
+  `* * *`.** Asterisks read as unrendered markdown source; em dashes abut into a
+  continuous line. Neither form contains a character needing escaping, so Phase 1's
+  escaping is unaffected either way.
+- **Phase 2 — top-level blockquotes carry a `Wrapper`, matching code blocks.** It
+  is the first multi-line wrapping element in the renderer, and it is exactly the
+  shape Phase 6 has to close and reopen, so giving it a wrapper now costs nothing
+  and means the split logic will not need a special case for it.
+- **Phase 2 — R6 and R34 are one line of code, and the realistic test is the one
+  that matters.** `ast.Text` carries `SoftLineBreak()` and `HardLineBreak()` flags
+  and upstream inspected neither. The per-construct cases pass trivially once the
+  flags are read; the test with teeth renders a two-paragraph reply wrapped at 80
+  columns and asserts every source word appears as a whole word and the newline
+  count survives, which is what catches a partial fix.
+- **Phase 2 — R7's test was already passing on arrival**, because Phase 1 had to
+  correct the malformed `<hr* * *` to satisfy its own tag-balance and tag-allowlist
+  requirements. This phase owned only the choice of separator string.
+
 ### Deferred to system testing
 
 - **Phase 1 — whether Telegram renders a literal `"` and a `%22` in `href`
@@ -132,3 +168,10 @@ no status updates, no restatement of the plan.
 - **Phase 1 — whether Telegram accepts `tg:` in an anchor `href`.** It is on the
   allowlist per the locked decision; dropping it is a one-line change and R16 holds
   either way.
+- **Phase 2 — whether the two-space nested-list indent is *visible* on a phone.**
+  The bytes are correct and pinned, and nesting depth is recoverable from the
+  output; how it looks at a given font and width is not assertable here.
+- **Phase 2 — whether ten em dashes read as a horizontal rule.** The bytes are
+  pinned; whether the glyphs abut into a continuous line depends on the client font.
+- **Phase 2 — whether a flattened nested quotation is confusing to a reader.** The
+  text of both levels survives, but the level distinction is gone by construction.
