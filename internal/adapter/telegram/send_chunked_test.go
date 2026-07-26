@@ -510,3 +510,65 @@ func TestSend_MultiByteReplyUnderTheCapRetriesPlainText(t *testing.T) {
 		t.Errorf("retry text = %q, want the original markdown", msgs[1].Text)
 	}
 }
+
+// TestSend_ReplyThatRendersToNothingFallsBackToPlainText covers the gap between
+// R29 and R28: a render that fails is sent as plain text, and a render that
+// succeeds is sent as HTML, but a render that succeeds and produces nothing was
+// neither — it returned no error and made no call.
+//
+// An image is the reachable case. Telegram's HTML subset cannot embed one, so
+// it degrades to an anchor labelled with its alternative text; with no
+// alternative text and a destination the scheme allowlist rejects, there is
+// nothing left to emit. The reply is not empty — the user wrote something — so
+// silence is a lost message, and the plain-text fallback already exists for
+// exactly the case where the rendered form cannot carry it.
+func TestSend_ReplyThatRendersToNothingFallsBackToPlainText(t *testing.T) {
+	bot := newFakeBot()
+	a := newWithSender(bot, nil, testLogger(), nil)
+
+	src := "![](./local.png)"
+	chunks, err := renderChunks(src)
+	if err != nil {
+		t.Fatalf("renderChunks: %v", err)
+	}
+	if len(chunks) != 0 {
+		t.Fatalf("fixture renders to %d chunks, want 0 — the test needs the empty render", len(chunks))
+	}
+
+	if err := a.Send(context.Background(), adapter.OutgoingMessage{
+		ExternalID: "12345",
+		Text:       src,
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	msgs := bot.messages(t)
+	if len(msgs) != 1 {
+		t.Fatalf("send count = %d, want 1 — the reply must reach the chat", len(msgs))
+	}
+	if msgs[0].ParseMode != "" {
+		t.Errorf("ParseMode = %q, want empty — there is no rendered form to send", msgs[0].ParseMode)
+	}
+	if msgs[0].Text != src {
+		t.Errorf("text = %q, want the original markdown %q", msgs[0].Text, src)
+	}
+}
+
+// TestSend_BlankReplySendsNothing is the other side of that boundary. A reply
+// with no characters in it renders to nothing for the ordinary reason, and
+// falling back would send Telegram a message it rejects as empty.
+func TestSend_BlankReplySendsNothing(t *testing.T) {
+	bot := newFakeBot()
+	a := newWithSender(bot, nil, testLogger(), nil)
+
+	if err := a.Send(context.Background(), adapter.OutgoingMessage{
+		ExternalID: "12345",
+		Text:       "   \n\t\n",
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if got := bot.sendCount(); got != 0 {
+		t.Errorf("send count = %d, want 0 — a blank reply is not a message", got)
+	}
+}

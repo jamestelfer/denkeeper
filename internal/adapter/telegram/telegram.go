@@ -404,8 +404,18 @@ func (a *Adapter) sendText(chatID int64, msg adapter.OutgoingMessage) (int, erro
 		a.logger.Debug("render failed, sending as plain text", "error", renderErr)
 		return a.sendPlain(base, markup)
 	}
+	// A render that produces nothing from a reply that has something in it is a
+	// message that would otherwise disappear: no send, no error, and callers that
+	// discard the error have no way to notice. It is the same predicament R29
+	// answers — the rendered form cannot carry the reply — so it takes the same
+	// exit rather than a silent one. A reply that is genuinely blank renders to
+	// nothing for the ordinary reason and is not a message at all.
 	if len(chunks) == 0 {
-		return 0, nil
+		if strings.TrimSpace(msg.Text) == "" {
+			return 0, nil
+		}
+		a.logger.Debug("render produced no output, sending as plain text")
+		return a.sendPlain(base, markup)
 	}
 
 	id, delivered, err := a.sendChunks(base, markup, chunks)
